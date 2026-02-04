@@ -1018,7 +1018,7 @@ const ProjectDetailPage = () => {
                   </CardHeader>
                   <CardContent>
                     <ScrollArea className="h-[300px] rounded-lg border bg-secondary/30 p-4">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} className="prose prose-sm dark:prose-invert max-w-none">{deploymentPlans[key]}</ReactMarkdown>
+                      <div className="prose prose-sm dark:prose-invert max-w-none"><ReactMarkdown remarkPlugins={[remarkGfm]}>{deploymentPlans[key]}</ReactMarkdown></div>
                     </ScrollArea>
                   </CardContent>
                 </Card>
@@ -1061,7 +1061,7 @@ const ProjectDetailPage = () => {
                   </CardHeader>
                   <CardContent>
                     <ScrollArea className="h-[300px] rounded-lg border bg-secondary/30 p-4">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} className="prose prose-sm dark:prose-invert max-w-none">{docs[key]}</ReactMarkdown>
+                      <div className="prose prose-sm dark:prose-invert max-w-none"><ReactMarkdown remarkPlugins={[remarkGfm]}>{docs[key]}</ReactMarkdown></div>
                     </ScrollArea>
                   </CardContent>
                 </Card>
