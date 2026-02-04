@@ -84,6 +84,13 @@ Project {
 | POST | /api/projects/:id/analyze | Run AI analysis |
 | POST | /api/projects/:id/generate | Generate plans/docs |
 | DELETE | /api/projects/:id | Delete project |
+| GET | /api/tiers | Get subscription tiers |
+| POST | /api/users | Create/get user |
+| GET | /api/users/:id | Get user by ID |
+| GET | /api/users/email/:email | Get user by email |
+| POST | /api/checkout/create | Start Stripe checkout |
+| GET | /api/checkout/status/:session_id | Check payment status |
+| POST | /api/webhook/stripe | Stripe webhook |
 
 ## Prioritized Backlog
 
