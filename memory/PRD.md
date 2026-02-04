@@ -49,6 +49,18 @@ MongoDB (projects collection)
   - Export as ZIP with proper repo structure
   - Dark theme default, theme toggle
 
+- **Feb 4, 2026**: Monetization Complete
+  - 3-tier subscription: Free ($0), Pro ($12/mo), Team ($29/mo)
+  - Stripe checkout integration with payment success polling
+  - User authentication via email (stored in localStorage)
+  - Feature gating:
+    - Free: 3 projects, Gemini only, no ZIP export, 1 re-analysis
+    - Pro: Unlimited projects, all AI providers, ZIP export, unlimited re-analysis
+    - Team: + collaboration, priority support, custom templates
+  - Upgrade dialogs when hitting tier limits
+  - Usage stats card on home page
+  - Pricing page with tier comparison
+
 ## Data Model
 ```javascript
 Project {
