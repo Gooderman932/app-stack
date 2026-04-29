@@ -31,6 +31,17 @@ import {
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// Google Play Billing product IDs (must match Play Console setup)
+const GOOGLE_PLAY_SKUS = {
+  pro: "stackpilot_pro_monthly",
+  team: "stackpilot_team_monthly",
+};
+
+// Detect Trusted Web Activity with Play Billing support
+const isInTWA = () =>
+  typeof window !== "undefined" &&
+  typeof window.getDigitalGoodsService === "function";
+
 // Theme Context
 const ThemeContext = createContext();
 const ThemeProvider = ({ children }) => {
@@ -258,11 +269,11 @@ const StatusBadge = ({ status }) => {
 
 // Pricing Page
 const PricingPage = () => {
-  const { user } = useUser();
+  const { user, refreshUser } = useUser();
   const navigate = useNavigate();
   const [loadingTier, setLoadingTier] = useState(null);
   const [showLogin, setShowLogin] = useState(false);
-  
+
   const tiers = [
     {
       id: "free",
@@ -296,16 +307,54 @@ const PricingPage = () => {
       color: "from-purple-500 to-pink-600"
     }
   ];
-  
+
+  const handleGooglePlayPurchase = async (tier) => {
+    const skuId = GOOGLE_PLAY_SKUS[tier];
+    try {
+      const service = await window.getDigitalGoodsService("https://play.google.com/billing");
+      const details = await service.getDetails([skuId]);
+      if (!details || details.length === 0) {
+        toast.error("Product not found in Play Store");
+        setLoadingTier(null);
+        return;
+      }
+      const item = details[0];
+      const request = new PaymentRequest(
+        [{ supportedMethods: "https://play.google.com/billing", data: { sku: skuId } }],
+        { total: { label: item.title, amount: item.price } }
+      );
+      const paymentResponse = await request.show();
+      const { purchaseToken } = paymentResponse.details;
+      await axios.post(`${API}/google-play/verify-purchase`, {
+        userId: user.id,
+        tier,
+        purchaseToken,
+        productId: skuId,
+      });
+      await paymentResponse.complete("success");
+      await refreshUser();
+      navigate("/payment/google-success");
+    } catch (e) {
+      toast.error(e?.message || "Purchase failed");
+      setLoadingTier(null);
+    }
+  };
+
   const handleUpgrade = async (tier) => {
     if (!user) {
       setShowLogin(true);
       return;
     }
-    
+
     if (tier === "free" || user.subscription === tier) return;
-    
+
     setLoadingTier(tier);
+
+    if (isInTWA()) {
+      await handleGooglePlayPurchase(tier);
+      return;
+    }
+
     try {
       const res = await axios.post(`${API}/checkout/create`, {
         userId: user.id,
@@ -1101,6 +1150,29 @@ const ProjectDetailPage = () => {
   );
 };
 
+// Google Play Payment Success Page
+const GooglePlaySuccessPage = () => {
+  const navigate = useNavigate();
+  return (
+    <div className="container max-w-lg py-16 px-4">
+      <Card>
+        <CardContent className="pt-8 text-center">
+          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-500/20">
+            <Check className="h-8 w-8 text-green-500" />
+          </div>
+          <h2 className="text-xl font-semibold mb-2">Purchase Successful!</h2>
+          <p className="text-muted-foreground mb-6">
+            Your subscription has been activated via Google Play.
+          </p>
+          <Button onClick={() => navigate("/")} className="bg-gradient-to-r from-cyan-500 to-blue-600">
+            Start Creating Projects
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
+  );
+};
+
 // Main App
 function App() {
   return (
@@ -1116,6 +1188,7 @@ function App() {
                 <Route path="/project/:id" element={<ProjectDetailPage />} />
                 <Route path="/pricing" element={<PricingPage />} />
                 <Route path="/payment/success" element={<PaymentSuccessPage />} />
+                <Route path="/payment/google-success" element={<GooglePlaySuccessPage />} />
               </Routes>
             </main>
           </BrowserRouter>

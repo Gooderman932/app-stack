@@ -15,6 +15,9 @@ import io
 import json
 import aiofiles
 import tempfile
+import base64
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
@@ -64,6 +67,27 @@ SUBSCRIPTION_TIERS = {
         "features": ["Everything in Pro", "Team collaboration", "Priority support", "Custom templates"]
     }
 }
+
+# --- Google Play Billing Config ---
+GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "com.stackpilot.app")
+
+# Maps Play Store product IDs to internal tier names
+GOOGLE_PLAY_PRODUCT_TIER_MAP = {
+    "stackpilot_pro_monthly": "pro",
+    "stackpilot_team_monthly": "team",
+}
+
+def _get_android_publisher_service():
+    """Build an authenticated androidpublisher service from the service account JSON env var."""
+    sa_json = os.environ.get("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise ValueError("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON environment variable is not set")
+    credentials_info = json.loads(sa_json)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/androidpublisher"],
+    )
+    return build("androidpublisher", "v3", credentials=credentials, cache_discovery=False)
 
 # --- Pydantic Models ---
 class DetectedTechStack(BaseModel):
@@ -160,6 +184,25 @@ class PaymentTransaction(BaseModel):
     currency: str = "usd"
     status: str = "pending"  # pending, paid, failed, expired
     paymentStatus: str = "initiated"
+    metadata: Dict = {}
+    createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updatedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class GooglePlayPurchaseRequest(BaseModel):
+    userId: str
+    tier: str           # pro or team
+    purchaseToken: str
+    productId: str      # matches GOOGLE_PLAY_SKUS on the frontend
+
+class GooglePlayTransaction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    userId: str
+    purchaseToken: str
+    productId: str
+    tier: str
+    status: str = "pending"   # pending, verified, invalid
+    orderId: Optional[str] = None
     metadata: Dict = {}
     createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updatedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -649,6 +692,139 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return {"status": "error", "message": str(e)}
+
+# --- Google Play Billing Routes ---
+
+@api_router.post("/google-play/verify-purchase")
+async def verify_google_play_purchase(request: GooglePlayPurchaseRequest):
+    """Verify a Google Play purchase token and activate the user's subscription."""
+    if request.tier not in ["pro", "team"]:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    user = await db.users.find_one({"id": request.userId}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Check the productId maps to the requested tier
+    expected_tier = GOOGLE_PLAY_PRODUCT_TIER_MAP.get(request.productId)
+    if expected_tier != request.tier:
+        raise HTTPException(status_code=400, detail="Product ID does not match requested tier")
+
+    # Prevent replay: reject already-used tokens
+    existing = await db.google_play_transactions.find_one(
+        {"purchaseToken": request.purchaseToken, "status": "verified"}, {"_id": 0}
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Purchase token already redeemed")
+
+    try:
+        service = _get_android_publisher_service()
+        result = service.purchases().subscriptions().get(
+            packageName=GOOGLE_PLAY_PACKAGE_NAME,
+            subscriptionId=request.productId,
+            token=request.purchaseToken,
+        ).execute()
+    except Exception as e:
+        logger.error(f"Google Play verification error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to verify purchase with Google Play")
+
+    # paymentState 1 = payment received, 2 = free trial
+    payment_state = result.get("paymentState")
+    if payment_state not in (1, 2):
+        raise HTTPException(status_code=402, detail="Purchase not in a paid state")
+
+    order_id = result.get("orderId", "")
+
+    # Record the transaction
+    tx = GooglePlayTransaction(
+        userId=request.userId,
+        purchaseToken=request.purchaseToken,
+        productId=request.productId,
+        tier=request.tier,
+        status="verified",
+        orderId=order_id,
+        metadata={"paymentState": payment_state, "countryCode": result.get("countryCode", "")},
+    )
+    tx_doc = tx.model_dump()
+    tx_doc["createdAt"] = tx_doc["createdAt"].isoformat()
+    tx_doc["updatedAt"] = tx_doc["updatedAt"].isoformat()
+    await db.google_play_transactions.insert_one(tx_doc)
+
+    # Upgrade user subscription
+    await db.users.update_one(
+        {"id": request.userId},
+        {"$set": {
+            "subscription": request.tier,
+            "subscriptionStatus": "active",
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+
+    return {"status": "verified", "tier": request.tier, "orderId": order_id}
+
+
+@api_router.post("/webhook/google-play")
+async def google_play_webhook(request: Request):
+    """
+    Handle Google Play Real-time Developer Notifications delivered via Cloud Pub/Sub push.
+    Configure the Pub/Sub subscription to push to this endpoint.
+    """
+    try:
+        body = await request.json()
+        # Pub/Sub wraps the notification in a base64-encoded message
+        message = body.get("message", {})
+        encoded_data = message.get("data", "")
+        notification_json = base64.b64decode(encoded_data).decode("utf-8")
+        notification = json.loads(notification_json)
+    except Exception as e:
+        logger.error(f"Google Play webhook parse error: {e}")
+        # Return 200 so Pub/Sub doesn't retry indefinitely on malformed messages
+        return {"status": "ignored"}
+
+    package_name = notification.get("packageName", "")
+    subscription_notification = notification.get("subscriptionNotification")
+
+    if not subscription_notification:
+        return {"status": "ignored"}
+
+    notification_type = subscription_notification.get("notificationType")
+    purchase_token = subscription_notification.get("purchaseToken")
+    subscription_id = subscription_notification.get("subscriptionId")
+
+    # notificationType 4 = SUBSCRIPTION_PURCHASED, 2 = SUBSCRIPTION_RENEWED
+    if notification_type in (2, 4) and purchase_token and subscription_id:
+        tier = GOOGLE_PLAY_PRODUCT_TIER_MAP.get(subscription_id)
+        if tier:
+            # Find the transaction record to get the userId
+            tx = await db.google_play_transactions.find_one(
+                {"purchaseToken": purchase_token}, {"_id": 0}
+            )
+            if tx:
+                await db.users.update_one(
+                    {"id": tx["userId"]},
+                    {"$set": {
+                        "subscription": tier,
+                        "subscriptionStatus": "active",
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                    }},
+                )
+
+    # notificationType 3 = SUBSCRIPTION_CANCELED, 13 = SUBSCRIPTION_EXPIRED
+    elif notification_type in (3, 13) and purchase_token:
+        tx = await db.google_play_transactions.find_one(
+            {"purchaseToken": purchase_token}, {"_id": 0}
+        )
+        if tx:
+            await db.users.update_one(
+                {"id": tx["userId"]},
+                {"$set": {
+                    "subscription": "free",
+                    "subscriptionStatus": "canceled",
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+
+    return {"status": "ok"}
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])

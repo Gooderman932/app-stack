@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">StackPilot</string>
+
+    <!--
+        Replace with your actual production domain.
+        This must match the host in assetlinks.json served at:
+        https://YOUR_DOMAIN/.well-known/assetlinks.json
+    -->
+    <string name="asset_statements_host">YOUR_DOMAIN</string>
+
+    <!-- The URL the TWA opens on launch -->
+    <string name="default_url">https://YOUR_DOMAIN</string>
+
+    <!-- Google Play subscription product IDs (must match Play Console and frontend GOOGLE_PLAY_SKUS) -->
+    <string name="billing_sku_pro">stackpilot_pro_monthly</string>
+    <string name="billing_sku_team">stackpilot_team_monthly</string>
+</resources>
