@@ -695,6 +695,36 @@ async def stripe_webhook(request: Request):
 
 # --- Google Play Billing Routes ---
 
+@api_router.get("/google-play/config-check")
+async def google_play_config_check():
+    """
+    Validate that the Google Play service account is reachable.
+    Call this after setting GOOGLE_PLAY_SERVICE_ACCOUNT_JSON to confirm
+    credentials work before going live. Returns 200 on success, 500 on failure.
+    """
+    sa_json = os.environ.get("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise HTTPException(
+            status_code=500,
+            detail="GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not set"
+        )
+    try:
+        credentials_info = json.loads(sa_json)
+        service_account.Credentials.from_service_account_info(
+            credentials_info,
+            scopes=["https://www.googleapis.com/auth/androidpublisher"],
+        )
+        client_email = credentials_info.get("client_email", "unknown")
+        return {
+            "status": "ok",
+            "client_email": client_email,
+            "package_name": GOOGLE_PLAY_PACKAGE_NAME,
+            "product_ids": list(GOOGLE_PLAY_PRODUCT_TIER_MAP.keys()),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Service account error: {e}")
+
+
 @api_router.post("/google-play/verify-purchase")
 async def verify_google_play_purchase(request: GooglePlayPurchaseRequest):
     """Verify a Google Play purchase token and activate the user's subscription."""

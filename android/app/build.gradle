@@ -37,11 +37,18 @@ android {
 }
 
 dependencies {
+    // AppCompat required for Theme.AppCompat.NoActionBar used in the manifest
+    implementation("androidx.appcompat:appcompat:1.7.0")
+
     // Trusted Web Activity launcher activity + custom tabs
     implementation("androidx.browser:browser:1.8.0")
+
+    // androidbrowserhelper provides LauncherActivity and DelegationService
+    // DelegationService is the native bridge that makes window.getDigitalGoodsService work
     implementation("com.google.androidbrowserhelper:androidbrowserhelper:2.5.0")
 
-    // Google Play Billing Library (bridges Digital Goods API calls from the web to native billing)
+    // Google Play Billing Library – required alongside DelegationService for
+    // the Digital Goods API to call through to Play Billing
     implementation("com.android.billingclient:billing:7.0.0")
     implementation("com.android.billingclient:billing-ktx:7.0.0")
 }

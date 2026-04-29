@@ -1,0 +1,2 @@
+Place ic_launcher.png (192x192px) and ic_launcher_round.png (192x192px) here.
+Generate with Android Studio: right-click res → New → Image Asset.
