@@ -1,0 +1,80 @@
+name: Build Android AAB
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Android versionCode (integer, e.g. 1)'
+        required: true
+        default: '1'
+      version_name:
+        description: 'Android versionName (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+      backend_url:
+        description: 'Live backend URL (e.g. https://api.yourdomain.com)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build React app
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: ${{ github.event.inputs.backend_url }}
+        run: npm run build
+
+      - name: Set version in build.gradle
+        working-directory: frontend/android/app
+        run: |
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.event.inputs.version_code }}/" build.gradle
+          sed -i "s/versionName \".*\"/versionName \"${{ github.event.inputs.version_name }}\"/" build.gradle
+
+      - name: Sync Capacitor assets
+        working-directory: frontend
+        run: npx cap sync android
+
+      - name: Decode keystore
+        working-directory: frontend/android/app
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p build
+          echo "$KEYSTORE_BASE64" | base64 --decode > build/release.keystore
+
+      - name: Build signed AAB
+        working-directory: frontend/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew bundleRelease
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stackpilot-${{ github.event.inputs.version_name }}.aab
+          path: frontend/android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
