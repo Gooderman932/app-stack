@@ -45,12 +45,6 @@ jobs:
           REACT_APP_BACKEND_URL: ${{ github.event.inputs.backend_url }}
         run: npm run build
 
-      - name: Set version in build.gradle
-        working-directory: frontend/android/app
-        run: |
-          sed -i "s/versionCode [0-9]*/versionCode ${{ github.event.inputs.version_code }}/" build.gradle
-          sed -i "s/versionName \".*\"/versionName \"${{ github.event.inputs.version_name }}\"/" build.gradle
-
       - name: Sync Capacitor assets
         working-directory: frontend
         run: npx cap sync android
@@ -70,7 +64,10 @@ jobs:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew bundleRelease
+        run: |
+          ./gradlew bundleRelease \
+            -PVERSION_CODE=${{ github.event.inputs.version_code }} \
+            -PVERSION_NAME=${{ github.event.inputs.version_name }}
 
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v4

@@ -7,8 +7,8 @@ android {
         applicationId "com.stackpilot.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode project.hasProperty('VERSION_CODE') ? project.VERSION_CODE.toInteger() : 1
+        versionName project.hasProperty('VERSION_NAME') ? project.VERSION_NAME : "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
@@ -16,17 +16,12 @@ android {
     }
     signingConfigs {
         release {
-            if (System.getenv("KEYSTORE_BASE64")) {
-                def keystoreFile = file("${buildDir}/release.keystore")
-                doFirst {
-                    keystoreFile.parentFile.mkdirs()
-                    keystoreFile.bytes = System.getenv("KEYSTORE_BASE64").decodeBase64()
-                }
-                storeFile keystoreFile
-                storePassword System.getenv("KEY_STORE_PASSWORD")
-                keyAlias System.getenv("KEY_ALIAS")
-                keyPassword System.getenv("KEY_PASSWORD")
-            }
+            // Keystore is decoded to this path by the CI step before Gradle runs
+            def keystoreFile = file("${buildDir}/release.keystore")
+            storeFile keystoreFile
+            storePassword System.getenv("KEY_STORE_PASSWORD")
+            keyAlias System.getenv("KEY_ALIAS")
+            keyPassword System.getenv("KEY_PASSWORD")
         }
     }
     buildTypes {
@@ -73,7 +68,7 @@ apply from: 'capacitor.build.gradle'
 
 try {
     def servicesJSON = file('google-services.json')
-    if (servicesJSON.text) {
+    if (servicesJSON.exists()) {
         apply plugin: 'com.google.gms.google-services'
     }
 } catch(Exception e) {
