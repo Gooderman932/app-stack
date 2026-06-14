@@ -17,6 +17,8 @@ import aiofiles
 import tempfile
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -503,6 +505,49 @@ async def get_user_by_email(email: str):
     
     return user
 
+# --- Google OAuth Route ---
+@api_router.post("/auth/google")
+async def auth_with_google(request: Request):
+    """Verify a Google ID token and create/return the user"""
+    body = await request.json()
+    credential = body.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing Google credential")
+
+    google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    if not google_client_id:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured on this server")
+
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            google_client_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+
+    email = idinfo["email"]
+    name = idinfo.get("name", email.split("@")[0])
+
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing:
+        project_count = await db.projects.count_documents({"userId": existing["id"]})
+        existing["projectCount"] = project_count
+        existing["tierLimits"] = SUBSCRIPTION_TIERS.get(existing.get("subscription", "free"))
+        return existing
+
+    user = User(email=email, name=name)
+    doc = user.model_dump()
+    doc["createdAt"] = doc["createdAt"].isoformat()
+    doc["updatedAt"] = doc["updatedAt"].isoformat()
+    await db.users.insert_one(doc)
+
+    user_dict = user.model_dump()
+    user_dict["projectCount"] = 0
+    user_dict["tierLimits"] = SUBSCRIPTION_TIERS["free"]
+    return user_dict
+
 # --- Stripe Payment Routes ---
 @api_router.post("/checkout/create")
 async def create_checkout_session(request: CheckoutRequest, http_request: Request):
@@ -524,10 +569,10 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
     # Initialize Stripe
     api_key = os.environ.get('STRIPE_API_KEY')
     host_url = str(http_request.base_url).rstrip('/')
-    webhook_url = f"{host_url}api/webhook/stripe"
-    
+    webhook_url = f"{host_url}/api/webhook/stripe"
+
     stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
-    
+
     # Create checkout session
     checkout_request = CheckoutSessionRequest(
         amount=amount,
@@ -567,10 +612,10 @@ async def get_checkout_status(session_id: str, http_request: Request):
     """Get checkout session status and update subscription"""
     api_key = os.environ.get('STRIPE_API_KEY')
     host_url = str(http_request.base_url).rstrip('/')
-    webhook_url = f"{host_url}api/webhook/stripe"
-    
+    webhook_url = f"{host_url}/api/webhook/stripe"
+
     stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
-    
+
     try:
         status = await stripe_checkout.get_checkout_status(session_id)
         
@@ -622,7 +667,7 @@ async def stripe_webhook(request: Request):
     
     api_key = os.environ.get('STRIPE_API_KEY')
     host_url = str(request.base_url).rstrip('/')
-    webhook_url = f"{host_url}api/webhook/stripe"
+    webhook_url = f"{host_url}/api/webhook/stripe"
     
     stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
     

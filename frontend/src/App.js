@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext, useCallback } from "react";
+import React, { useState, useEffect, useRef, createContext, useContext, useCallback } from "react";
 import "@/App.css";
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import axios from "axios";
@@ -79,7 +79,19 @@ const UserProvider = ({ children }) => {
       return null;
     }
   };
-  
+
+  const loginWithGoogle = async (credential) => {
+    try {
+      const res = await axios.post(`${API}/auth/google`, { credential });
+      setUser(res.data);
+      localStorage.setItem("userEmail", res.data.email);
+      return res.data;
+    } catch (e) {
+      toast.error("Google login failed");
+      return null;
+    }
+  };
+
   const logout = () => {
     setUser(null);
     localStorage.removeItem("userEmail");
@@ -92,7 +104,7 @@ const UserProvider = ({ children }) => {
   };
   
   return (
-    <UserContext.Provider value={{ user, loading, login, logout, refreshUser }}>
+    <UserContext.Provider value={{ user, loading, login, loginWithGoogle, logout, refreshUser }}>
       {children}
     </UserContext.Provider>
   );
@@ -163,11 +175,52 @@ const Header = () => {
 
 // Login Dialog
 const LoginDialog = ({ open, onOpenChange }) => {
-  const { login } = useUser();
+  const { login, loginWithGoogle } = useUser();
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
-  
+  const googleButtonRef = useRef(null);
+  const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
+
+  useEffect(() => {
+    if (!open || !GOOGLE_CLIENT_ID) return;
+
+    const initGoogle = () => {
+      if (!window.google?.accounts || !googleButtonRef.current) return;
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleResponse,
+      });
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        theme: "outline",
+        size: "large",
+        width: googleButtonRef.current.offsetWidth || 360,
+        text: "signin_with",
+      });
+    };
+
+    if (window.google?.accounts) {
+      initGoogle();
+    } else {
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.onload = initGoogle;
+      document.head.appendChild(script);
+    }
+  }, [open, GOOGLE_CLIENT_ID]);
+
+  const handleGoogleResponse = async (response) => {
+    setLoading(true);
+    const result = await loginWithGoogle(response.credential);
+    setLoading(false);
+    if (result) {
+      toast.success("Welcome!");
+      onOpenChange(false);
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!email) return;
@@ -179,14 +232,26 @@ const LoginDialog = ({ open, onOpenChange }) => {
       onOpenChange(false);
     }
   };
-  
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Welcome to StackPilot</DialogTitle>
-          <DialogDescription>Enter your email to get started</DialogDescription>
+          <DialogDescription>Sign in to get started</DialogDescription>
         </DialogHeader>
+
+        {GOOGLE_CLIENT_ID && (
+          <>
+            <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
+            <div className="relative flex items-center gap-3">
+              <Separator className="flex-1" />
+              <span className="text-xs text-muted-foreground">or continue with email</span>
+              <Separator className="flex-1" />
+            </div>
+          </>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
             <Label>Email *</Label>
@@ -685,7 +750,9 @@ const InputProjectPage = () => {
   const handleSubmit = async () => {
     if (!formData.name.trim()) { toast.error("Project name required"); return; }
     if (formData.sourceType === "github_url" && !formData.sourceUrl) { toast.error("GitHub URL required"); return; }
+    if (formData.sourceType === "github_url" && !formData.sourceUrl.includes("github.com")) { toast.error("Please enter a valid GitHub URL"); return; }
     if (formData.sourceType === "upload" && !uploadedFile) { toast.error("Upload a ZIP file"); return; }
+    if (formData.sourceType === "text_only" && !formData.textDescription.trim()) { toast.error("Project description required for text-only mode"); return; }
     
     setLoading(true);
     setProgress(10);
@@ -760,15 +827,25 @@ const InputProjectPage = () => {
                 <div {...getRootProps()} className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-8 transition-colors ${isDragActive ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"}`} data-testid="file-dropzone">
                   <input {...getInputProps()} />
                   <Upload className="mb-3 h-8 w-8 text-muted-foreground" />
-                  {uploadedFile ? <p className="text-sm font-medium">{uploadedFile.name}</p> : <p className="text-sm text-muted-foreground">Drag & drop ZIP file here</p>}
+                  {uploadedFile ? <p className="text-sm font-medium">{uploadedFile.name}</p> : <p className="text-sm text-muted-foreground">Drag & drop ZIP file here, or click to select</p>}
                 </div>
+              </TabsContent>
+
+              <TabsContent value="text_only" className="mt-4">
+                <p className="text-sm text-muted-foreground">Describe your project below — no code upload needed. The AI will generate plans and docs based on your description.</p>
               </TabsContent>
             </Tabs>
           </div>
-          
+
           <div className="space-y-2">
-            <Label>Additional Context (Optional)</Label>
-            <Textarea placeholder="Describe your project..." value={formData.textDescription} onChange={(e) => setFormData({ ...formData, textDescription: e.target.value })} rows={3} data-testid="text-description-input" />
+            <Label>{formData.sourceType === "text_only" ? "Project Description *" : "Additional Context (Optional)"}</Label>
+            <Textarea
+              placeholder={formData.sourceType === "text_only" ? "Describe your project in detail: tech stack, architecture, deployment targets..." : "Describe your project..."}
+              value={formData.textDescription}
+              onChange={(e) => setFormData({ ...formData, textDescription: e.target.value })}
+              rows={formData.sourceType === "text_only" ? 5 : 3}
+              data-testid="text-description-input"
+            />
           </div>
           
           <Separator />
