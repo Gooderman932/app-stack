@@ -21,6 +21,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
+import { Capacitor } from "@capacitor/core";
+import { GoogleAuth } from "@codetrix-studio/capacitor-google-auth";
 import {
   Rocket, FileCode, Server, Cloud, Box, Sun, Moon, Plus, ArrowLeft,
   Github, Upload, FileText, Loader2, Check, Copy, Download, FolderTree,
@@ -30,6 +32,9 @@ import {
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
+
+// True when running inside the native Android (Capacitor) app rather than a browser.
+const IS_NATIVE = Capacitor.isNativePlatform();
 
 // Theme Context
 const ThemeContext = createContext();
@@ -182,8 +187,23 @@ const LoginDialog = ({ open, onOpenChange }) => {
   const googleButtonRef = useRef(null);
   const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
 
+  // Native (Android app): initialize the Google Sign-In plugin once.
   useEffect(() => {
-    if (!open || !GOOGLE_CLIENT_ID) return;
+    if (!IS_NATIVE) return;
+    try {
+      GoogleAuth.initialize({
+        clientId: GOOGLE_CLIENT_ID,
+        scopes: ["profile", "email"],
+        grantOfflineAccess: false,
+      });
+    } catch (e) {
+      // initialize is best-effort; signIn will surface real errors
+    }
+  }, [GOOGLE_CLIENT_ID]);
+
+  // Web: load Google Identity Services and render the official button.
+  useEffect(() => {
+    if (IS_NATIVE || !open || !GOOGLE_CLIENT_ID) return;
 
     const initGoogle = () => {
       if (!window.google?.accounts || !googleButtonRef.current) return;
@@ -221,6 +241,25 @@ const LoginDialog = ({ open, onOpenChange }) => {
     }
   };
 
+  // Native (Android app): trigger the system Google account picker.
+  const handleNativeGoogle = async () => {
+    setLoading(true);
+    try {
+      const user = await GoogleAuth.signIn();
+      const idToken = user?.authentication?.idToken;
+      if (!idToken) throw new Error("No ID token returned");
+      const result = await loginWithGoogle(idToken);
+      if (result) {
+        toast.success("Welcome!");
+        onOpenChange(false);
+      }
+    } catch (e) {
+      toast.error("Google login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!email) return;
@@ -241,7 +280,19 @@ const LoginDialog = ({ open, onOpenChange }) => {
           <DialogDescription>Sign in to get started</DialogDescription>
         </DialogHeader>
 
-        {GOOGLE_CLIENT_ID && (
+        {IS_NATIVE ? (
+          <>
+            <Button variant="outline" className="w-full" onClick={handleNativeGoogle} disabled={loading} data-testid="google-signin-native">
+              {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              Continue with Google
+            </Button>
+            <div className="relative flex items-center gap-3">
+              <Separator className="flex-1" />
+              <span className="text-xs text-muted-foreground">or continue with email</span>
+              <Separator className="flex-1" />
+            </div>
+          </>
+        ) : GOOGLE_CLIENT_ID ? (
           <>
             <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
             <div className="relative flex items-center gap-3">
@@ -250,7 +301,7 @@ const LoginDialog = ({ open, onOpenChange }) => {
               <Separator className="flex-1" />
             </div>
           </>
-        )}
+        ) : null}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">

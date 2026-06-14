@@ -4,4 +4,9 @@
     <string name="title_activity_main">App Stack</string>
     <string name="package_name">com.poordudeholdings.appstack</string>
     <string name="custom_url_scheme">com.poordudeholdings.appstack</string>
+    <!-- Google Sign-In: paste your WEB OAuth client ID here (same value as
+         REACT_APP_GOOGLE_CLIENT_ID / backend GOOGLE_CLIENT_ID). Ends in
+         .apps.googleusercontent.com. Native sign-in mints an ID token for
+         THIS web client so the backend can verify it. -->
+    <string name="server_client_id">YOUR_WEB_CLIENT_ID.apps.googleusercontent.com</string>
 </resources>
