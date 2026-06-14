@@ -164,6 +164,14 @@ class PaymentTransaction(BaseModel):
     createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updatedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+class GooglePlayVerifyRequest(BaseModel):
+    userId: str
+    tier: str          # pro or team
+    purchaseToken: str
+    orderId: str
+    productId: str
+    packageName: str = "com.stackpilot.app"
+
 # --- Helper Functions ---
 def get_ai_model(provider: str):
     models = {
@@ -649,6 +657,100 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return {"status": "error", "message": str(e)}
+
+# --- Google Play Billing ---
+
+async def _verify_with_play_api(package_name: str, product_id: str, purchase_token: str) -> bool:
+    """
+    Verify a subscription purchase token with the Google Play Developer API.
+    Requires GOOGLE_PLAY_CREDENTIALS_JSON env var (service account JSON as a string).
+    Returns True if the subscription is active/valid, False otherwise.
+    Falls back to True (trust client) if credentials are not configured.
+    """
+    creds_json = os.environ.get("GOOGLE_PLAY_CREDENTIALS_JSON")
+    if not creds_json:
+        logger.warning("GOOGLE_PLAY_CREDENTIALS_JSON not set — skipping server-side Play Store verification (set this in production)")
+        return True
+
+    try:
+        import json as _json
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        creds_info = _json.loads(creds_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/androidpublisher"]
+        )
+        service = build("androidpublisher", "v3", credentials=credentials, cache_discovery=False)
+        result = service.purchases().subscriptionsv2().get(
+            packageName=package_name,
+            token=purchase_token
+        ).execute()
+
+        subscription_state = result.get("subscriptionState", "")
+        # SUBSCRIPTION_STATE_ACTIVE or SUBSCRIPTION_STATE_IN_GRACE_PERIOD are valid
+        return subscription_state in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD")
+    except Exception as e:
+        logger.error(f"Google Play API verification error: {e}")
+        return False
+
+
+@api_router.post("/google-play/verify-purchase")
+async def verify_google_play_purchase(request: GooglePlayVerifyRequest):
+    """
+    Verify a Google Play subscription purchase token and activate the subscription.
+    Called by the Android app immediately after a successful billing flow.
+    """
+    if request.tier not in ["pro", "team"]:
+        raise HTTPException(status_code=400, detail="Invalid subscription tier")
+
+    user = await db.users.find_one({"id": request.userId}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Reject duplicate tokens that are already recorded as paid
+    existing = await db.google_play_purchases.find_one({"purchaseToken": request.purchaseToken, "status": "active"})
+    if existing:
+        if existing["userId"] != request.userId:
+            raise HTTPException(status_code=409, detail="Purchase token already used by another account")
+        # Idempotent: same user, same token — return success
+        return {"status": "ok", "subscription": request.tier}
+
+    # Verify with Google Play Developer API
+    is_valid = await _verify_with_play_api(request.packageName, request.productId, request.purchaseToken)
+    if not is_valid:
+        raise HTTPException(status_code=402, detail="Purchase could not be verified with Google Play")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Persist the purchase record
+    await db.google_play_purchases.insert_one({
+        "id": str(uuid.uuid4()),
+        "userId": request.userId,
+        "tier": request.tier,
+        "purchaseToken": request.purchaseToken,
+        "orderId": request.orderId,
+        "productId": request.productId,
+        "packageName": request.packageName,
+        "status": "active",
+        "createdAt": now,
+        "updatedAt": now,
+    })
+
+    # Activate the subscription on the user record
+    await db.users.update_one(
+        {"id": request.userId},
+        {"$set": {
+            "subscription": request.tier,
+            "subscriptionStatus": "active",
+            "updatedAt": now,
+        }}
+    )
+
+    logger.info(f"Google Play subscription activated: userId={request.userId} tier={request.tier} orderId={request.orderId}")
+    return {"status": "ok", "subscription": request.tier}
+
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])

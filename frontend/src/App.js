@@ -1,6 +1,7 @@
 import React, { useState, useEffect, createContext, useContext, useCallback } from "react";
 import "@/App.css";
 import { BrowserRouter, Routes, Route, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { isPlayBillingAvailable, purchaseSubscription, acknowledgePurchase, queryProduct, PLAY_PRODUCTS } from "@/lib/billing";
 import axios from "axios";
 import { Toaster, toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -258,11 +259,28 @@ const StatusBadge = ({ status }) => {
 
 // Pricing Page
 const PricingPage = () => {
-  const { user } = useUser();
+  const { user, refreshUser } = useUser();
   const navigate = useNavigate();
   const [loadingTier, setLoadingTier] = useState(null);
   const [showLogin, setShowLogin] = useState(false);
-  
+  // Live prices fetched from Google Play on Android; null = use hardcoded fallback
+  const [playPrices, setPlayPrices] = useState({});
+
+  useEffect(() => {
+    if (!isPlayBillingAvailable()) return;
+    const fetchPrices = async () => {
+      const [pro, team] = await Promise.all([
+        queryProduct(PLAY_PRODUCTS.pro.id),
+        queryProduct(PLAY_PRODUCTS.team.id),
+      ]);
+      setPlayPrices({
+        pro:  pro?.price  ?? null,
+        team: team?.price ?? null,
+      });
+    };
+    fetchPrices();
+  }, []);
+
   const tiers = [
     {
       id: "free",
@@ -302,10 +320,46 @@ const PricingPage = () => {
       setShowLogin(true);
       return;
     }
-    
     if (tier === "free" || user.subscription === tier) return;
-    
+
     setLoadingTier(tier);
+
+    // --- Android: Google Play Billing ---
+    if (isPlayBillingAvailable()) {
+      const product = PLAY_PRODUCTS[tier];
+      if (!product) {
+        toast.error("Unknown subscription tier");
+        setLoadingTier(null);
+        return;
+      }
+      try {
+        const purchase = await purchaseSubscription(product.id, product.type);
+        // Send purchase token to backend for verification + subscription activation
+        await axios.post(`${API}/google-play/verify-purchase`, {
+          userId: user.id,
+          tier,
+          purchaseToken: purchase.purchaseToken,
+          orderId: purchase.orderId,
+          productId: purchase.productId ?? product.id,
+          packageName: purchase.packageName ?? "com.stackpilot.app",
+        });
+        // Acknowledge to prevent automatic refund (must happen within 3 days)
+        await acknowledgePurchase(purchase.purchaseToken);
+        await refreshUser();
+        toast.success("Subscription activated!");
+        navigate("/");
+      } catch (e) {
+        if (e?.message?.includes("canceled")) {
+          toast.info("Purchase cancelled");
+        } else {
+          toast.error(e?.response?.data?.detail ?? "Purchase failed. Please try again.");
+        }
+        setLoadingTier(null);
+      }
+      return;
+    }
+
+    // --- Web: Stripe redirect (unchanged) ---
     try {
       const res = await axios.post(`${API}/checkout/create`, {
         userId: user.id,
@@ -346,7 +400,13 @@ const PricingPage = () => {
                 <CardTitle>{tier.name}</CardTitle>
                 <CardDescription>{tier.description}</CardDescription>
                 <div className="mt-4">
-                  <span className="text-4xl font-bold">${tier.price}</span>
+                  {isPlayBillingAvailable() && tier.price > 0 ? (
+                    <span className="text-4xl font-bold">
+                      {playPrices[tier.id] ?? `$${tier.price}`}
+                    </span>
+                  ) : (
+                    <span className="text-4xl font-bold">${tier.price}</span>
+                  )}
                   {tier.price > 0 && <span className="text-muted-foreground">/month</span>}
                 </div>
               </CardHeader>
