@@ -1,0 +1,8 @@
+{
+  "appId": "com.poordudeholdings.appstack",
+  "appName": "App Stack",
+  "webDir": "build",
+  "server": {
+    "androidScheme": "https"
+  }
+}
