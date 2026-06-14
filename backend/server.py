@@ -16,10 +16,11 @@ import json
 import aiofiles
 import tempfile
 import asyncio
-import stripe
 from google import genai
 from google.genai import types
 from google.oauth2 import id_token
+from google.oauth2 import service_account as google_service_account
+from googleapiclient.discovery import build as google_api_build
 from google.auth.transport import requests as google_requests
 
 ROOT_DIR = Path(__file__).parent
@@ -32,6 +33,15 @@ db = client[os.environ['DB_NAME']]
 
 # Gemini model used for all AI generation (overridable via env)
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+
+# Google Play Billing config
+PLAY_PACKAGE_NAME = os.environ.get('GOOGLE_PLAY_PACKAGE_NAME', 'com.poordudeholdings.appstack')
+PLAY_SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_PLAY_SERVICE_ACCOUNT_FILE')
+# Map Play Store subscription product IDs -> internal tier names
+PLAY_PRODUCT_TIERS = {
+    "pro": "pro",
+    "team": "team",
+}
 
 # Create the main app
 app = FastAPI()
@@ -152,10 +162,10 @@ class UserCreate(BaseModel):
     email: str
     name: Optional[str] = None
 
-class CheckoutRequest(BaseModel):
+class PlayVerifyRequest(BaseModel):
     userId: str
-    tier: str  # pro or team
-    originUrl: str
+    productId: str  # Play Store subscription product ID (e.g. "pro", "team")
+    purchaseToken: str
 
 class PaymentTransaction(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -557,157 +567,75 @@ async def auth_with_google(request: Request):
     user_dict["tierLimits"] = SUBSCRIPTION_TIERS["free"]
     return user_dict
 
-# --- Stripe Payment Routes ---
-@api_router.post("/checkout/create")
-async def create_checkout_session(request: CheckoutRequest, http_request: Request):
-    """Create Stripe checkout session for subscription"""
-    if request.tier not in ["pro", "team"]:
-        raise HTTPException(status_code=400, detail="Invalid tier")
-    
+# --- Google Play Billing ---
+def _play_publisher():
+    """Build an authenticated Android Publisher API client from a service account."""
+    creds = google_service_account.Credentials.from_service_account_file(
+        PLAY_SERVICE_ACCOUNT_FILE,
+        scopes=["https://www.googleapis.com/auth/androidpublisher"],
+    )
+    return google_api_build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
+
+
+@api_router.post("/billing/verify")
+async def verify_play_purchase(request: PlayVerifyRequest):
+    """Verify a Google Play subscription purchase token and grant the matching tier."""
+    if not PLAY_SERVICE_ACCOUNT_FILE:
+        raise HTTPException(status_code=500, detail="Play billing not configured on this server")
+
+    tier = PLAY_PRODUCT_TIERS.get(request.productId)
+    if not tier:
+        raise HTTPException(status_code=400, detail="Unknown product")
+
     user = await db.users.find_one({"id": request.userId}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Get amount from server-side definition
-    amount = SUBSCRIPTION_TIERS[request.tier]["price"]
-    
-    # Build URLs from provided origin
-    success_url = f"{request.originUrl}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{request.originUrl}/pricing"
-    
-    # Initialize Stripe
-    stripe.api_key = os.environ.get('STRIPE_API_KEY')
 
-    # Create checkout session (one-time payment in cents)
-    session = await asyncio.to_thread(
-        lambda: stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": f"{SUBSCRIPTION_TIERS[request.tier]['name']} plan"},
-                    "unit_amount": int(round(amount * 100)),
-                },
-                "quantity": 1,
-            }],
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={
-                "user_id": request.userId,
-                "tier": request.tier,
-                "user_email": user.get("email", ""),
-            },
+    # Validate the purchase token against the Play Developer API (subscriptions v2)
+    try:
+        service = _play_publisher()
+        result = await asyncio.to_thread(
+            lambda: service.purchases().subscriptionsv2().get(
+                packageName=PLAY_PACKAGE_NAME,
+                token=request.purchaseToken,
+            ).execute()
         )
-    )
+    except Exception as e:
+        logger.error(f"Play verification error: {e}")
+        raise HTTPException(status_code=400, detail="Could not verify purchase")
 
-    # Create payment transaction record
+    state = result.get("subscriptionState")
+    active = state in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD")
+    if not active:
+        raise HTTPException(status_code=400, detail=f"Subscription not active ({state})")
+
+    # Record the transaction and upgrade the user's tier
+    now_iso = datetime.now(timezone.utc).isoformat()
     transaction = PaymentTransaction(
         userId=request.userId,
-        sessionId=session.id,
-        tier=request.tier,
-        amount=amount,
+        sessionId=request.purchaseToken,
+        tier=tier,
+        amount=SUBSCRIPTION_TIERS.get(tier, {}).get("price", 0.0),
         currency="usd",
-        status="pending",
-        paymentStatus="initiated",
-        metadata={"user_email": user.get("email", "")}
+        status="paid",
+        paymentStatus="paid",
+        metadata={"productId": request.productId, "source": "google_play"},
+    )
+    tx_doc = transaction.model_dump()
+    tx_doc["createdAt"] = tx_doc["createdAt"].isoformat()
+    tx_doc["updatedAt"] = tx_doc["updatedAt"].isoformat()
+    await db.payment_transactions.update_one(
+        {"sessionId": request.purchaseToken},
+        {"$set": tx_doc},
+        upsert=True,
     )
 
-    tx_doc = transaction.model_dump()
-    tx_doc['createdAt'] = tx_doc['createdAt'].isoformat()
-    tx_doc['updatedAt'] = tx_doc['updatedAt'].isoformat()
-    await db.payment_transactions.insert_one(tx_doc)
+    await db.users.update_one(
+        {"id": request.userId},
+        {"$set": {"subscription": tier, "subscriptionStatus": "active", "updatedAt": now_iso}},
+    )
 
-    return {"url": session.url, "sessionId": session.id}
-
-@api_router.get("/checkout/status/{session_id}")
-async def get_checkout_status(session_id: str, http_request: Request):
-    """Get checkout session status and update subscription"""
-    stripe.api_key = os.environ.get('STRIPE_API_KEY')
-
-    try:
-        session = await asyncio.to_thread(stripe.checkout.Session.retrieve, session_id)
-        payment_status = session.payment_status  # "paid" / "unpaid" / "no_payment_required"
-        session_status = session.status          # "open" / "complete" / "expired"
-
-        # Find the transaction
-        transaction = await db.payment_transactions.find_one({"sessionId": session_id}, {"_id": 0})
-
-        if transaction and payment_status == "paid" and transaction.get("status") != "paid":
-            # Update transaction
-            await db.payment_transactions.update_one(
-                {"sessionId": session_id},
-                {"$set": {
-                    "status": "paid",
-                    "paymentStatus": payment_status,
-                    "updatedAt": datetime.now(timezone.utc).isoformat()
-                }}
-            )
-
-            # Upgrade user subscription
-            tier = transaction.get("tier", "pro")
-            await db.users.update_one(
-                {"id": transaction["userId"]},
-                {"$set": {
-                    "subscription": tier,
-                    "subscriptionStatus": "active",
-                    "updatedAt": datetime.now(timezone.utc).isoformat()
-                }}
-            )
-        elif transaction and session_status == "expired":
-            await db.payment_transactions.update_one(
-                {"sessionId": session_id},
-                {"$set": {"status": "expired", "updatedAt": datetime.now(timezone.utc).isoformat()}}
-            )
-
-        return {
-            "status": session_status,
-            "paymentStatus": payment_status,
-            "amount": (session.amount_total or 0) / 100,
-            "currency": session.currency
-        }
-    except Exception as e:
-        logger.error(f"Checkout status error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get checkout status")
-
-@api_router.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
-    """Handle Stripe webhooks"""
-    body = await request.body()
-    signature = request.headers.get("Stripe-Signature")
-
-    stripe.api_key = os.environ.get('STRIPE_API_KEY')
-    webhook_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
-    if not webhook_secret:
-        logger.error("STRIPE_WEBHOOK_SECRET not configured")
-        return {"status": "error", "message": "Webhook secret not configured"}
-
-    try:
-        event = stripe.Webhook.construct_event(body, signature, webhook_secret)
-
-        if event["type"] in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
-            session = event["data"]["object"]
-            if session.get("payment_status") == "paid":
-                session_id = session["id"]
-                metadata = session.get("metadata") or {}
-                transaction = await db.payment_transactions.find_one({"sessionId": session_id}, {"_id": 0})
-                if transaction and transaction.get("status") != "paid":
-                    await db.payment_transactions.update_one(
-                        {"sessionId": session_id},
-                        {"$set": {"status": "paid", "paymentStatus": "paid", "updatedAt": datetime.now(timezone.utc).isoformat()}}
-                    )
-
-                    tier = metadata.get("tier", "pro")
-                    user_id = metadata.get("user_id")
-                    if user_id:
-                        await db.users.update_one(
-                            {"id": user_id},
-                            {"$set": {"subscription": tier, "subscriptionStatus": "active", "updatedAt": datetime.now(timezone.utc).isoformat()}}
-                        )
-        
-        return {"status": "ok"}
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return {"status": "error", "message": str(e)}
+    return {"status": "active", "tier": tier}
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])

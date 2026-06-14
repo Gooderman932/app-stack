@@ -23,6 +23,7 @@ import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import { Capacitor } from "@capacitor/core";
 import { GoogleAuth } from "@codetrix-studio/capacitor-google-auth";
+import "cordova-plugin-purchase"; // exposes window.CdvPurchase (Google Play Billing)
 import {
   Rocket, FileCode, Server, Cloud, Box, Sun, Moon, Plus, ArrowLeft,
   Github, Upload, FileText, Loader2, Check, Copy, Download, FolderTree,
@@ -374,10 +375,47 @@ const StatusBadge = ({ status }) => {
 
 // Pricing Page
 const PricingPage = () => {
-  const { user } = useUser();
+  const { user, refreshUser } = useUser();
   const navigate = useNavigate();
   const [loadingTier, setLoadingTier] = useState(null);
   const [showLogin, setShowLogin] = useState(false);
+
+  // Keep the current user id available to the (once-registered) billing callbacks.
+  const userIdRef = useRef(null);
+  useEffect(() => { userIdRef.current = user?.id || null; }, [user]);
+
+  // Native Android: initialize Google Play Billing once and wire purchase verification.
+  useEffect(() => {
+    if (!IS_NATIVE || !window.CdvPurchase) return;
+    const { store, ProductType, Platform } = window.CdvPurchase;
+
+    store.register([
+      { id: "pro", type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY },
+      { id: "team", type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY },
+    ]);
+
+    store.when().approved(async (transaction) => {
+      const productId = transaction.products?.[0]?.id;
+      const purchaseToken = transaction.nativePurchase?.purchaseToken;
+      const uid = userIdRef.current;
+      if (uid && productId && purchaseToken) {
+        try {
+          const res = await axios.post(`${API}/billing/verify`, { userId: uid, productId, purchaseToken });
+          if (res.data?.status === "active") {
+            await refreshUser();
+            toast.success("Subscription active!");
+          }
+        } catch (e) {
+          toast.error("Could not verify purchase");
+        }
+      }
+      transaction.finish();
+      setLoadingTier(null);
+    });
+
+    store.initialize([Platform.GOOGLE_PLAY]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   
   const tiers = [
     {
@@ -420,19 +458,29 @@ const PricingPage = () => {
     }
     
     if (tier === "free" || user.subscription === tier) return;
-    
-    setLoadingTier(tier);
-    try {
-      const res = await axios.post(`${API}/checkout/create`, {
-        userId: user.id,
-        tier,
-        originUrl: window.location.origin
-      });
-      window.location.href = res.data.url;
-    } catch (e) {
-      toast.error("Failed to start checkout");
-      setLoadingTier(null);
+
+    // Native Android: purchase through Google Play Billing.
+    if (IS_NATIVE && window.CdvPurchase) {
+      try {
+        setLoadingTier(tier);
+        const { store, Platform } = window.CdvPurchase;
+        const product = store.get(tier, Platform.GOOGLE_PLAY);
+        const offer = product?.getOffer();
+        if (!offer) {
+          toast.error("This plan isn't available yet");
+          setLoadingTier(null);
+          return;
+        }
+        await store.order(offer); // entitlement is granted in the approved() handler
+      } catch (e) {
+        toast.error("Purchase failed");
+        setLoadingTier(null);
+      }
+      return;
     }
+
+    // Web: subscriptions are only sold inside the Android app.
+    toast.info("Subscriptions are available in the App Stack Android app.");
   };
   
   return (
