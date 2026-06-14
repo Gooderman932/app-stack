@@ -856,17 +856,8 @@ const InputProjectPage = () => {
               <SelectTrigger data-testid="ai-provider-select"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="gemini">Gemini (Google)</SelectItem>
-                <SelectItem value="gpt_5_2" disabled={!allowedProviders.includes("gpt_5_2")}>
-                  GPT-5.2 (OpenAI) {!allowedProviders.includes("gpt_5_2") && <Lock className="h-3 w-3 inline ml-1" />}
-                </SelectItem>
-                <SelectItem value="claude" disabled={!allowedProviders.includes("claude")}>
-                  Claude (Anthropic) {!allowedProviders.includes("claude") && <Lock className="h-3 w-3 inline ml-1" />}
-                </SelectItem>
               </SelectContent>
             </Select>
-            {!allowedProviders.includes("gpt_5_2") && (
-              <p className="text-xs text-muted-foreground">Upgrade to Pro for GPT-5.2 and Claude</p>
-            )}
           </div>
           
           {loading && (
