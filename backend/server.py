@@ -15,8 +15,10 @@ import io
 import json
 import aiofiles
 import tempfile
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+import asyncio
+import stripe
+from google import genai
+from google.genai import types
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -27,6 +29,9 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+
+# Gemini model used for all AI generation (overridable via env)
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 
 # Create the main app
 app = FastAPI()
@@ -167,14 +172,28 @@ class PaymentTransaction(BaseModel):
     updatedAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # --- Helper Functions ---
-def get_ai_model(provider: str):
-    models = {
-        "gpt_5_2": ("openai", "gpt-5.2"),
-        "claude": ("anthropic", "claude-sonnet-4-5-20250929"),
-        "gemini": ("gemini", "gemini-3-flash-preview"),
-        "emergent_default": ("openai", "gpt-5.2")
-    }
-    return models.get(provider, ("gemini", "gemini-3-flash-preview"))
+def get_ai_model(provider: str) -> str:
+    """All providers currently route to Gemini (the configured free model)."""
+    return GEMINI_MODEL
+
+
+async def call_llm(system_message: str, prompt: str, provider: str) -> str:
+    """Send a single prompt to Gemini and return the text response (JSON-formatted)."""
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not configured on this server")
+
+    model_name = get_ai_model(provider)
+    genai_client = genai.Client(api_key=api_key)
+    response = await genai_client.aio.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_message,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text or ""
 
 async def get_user_tier_limits(user_id: str) -> dict:
     """Get user's subscription tier and limits"""
@@ -279,9 +298,6 @@ def parse_uploaded_zip(file_content: bytes) -> dict:
     return files_content
 
 async def analyze_with_ai(files_content: dict, text_description: str, hints: List[str], provider: str) -> dict:
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
-    provider_name, model_name = get_ai_model(provider)
-    
     files_summary = ""
     for fname, content in files_content.items():
         files_summary += f"\n--- {fname} ---\n{content[:2000]}\n"
@@ -312,13 +328,11 @@ Tech stack hints: {', '.join(hints) if hints else 'None'}
 Return ONLY valid JSON."""
 
     try:
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"analyze-{uuid.uuid4()}",
-            system_message="You are a code analysis expert. Always return valid JSON only."
-        ).with_model(provider_name, model_name)
-        
-        response = await chat.send_message(UserMessage(text=prompt))
+        response = await call_llm(
+            system_message="You are a code analysis expert. Always return valid JSON only.",
+            prompt=prompt,
+            provider=provider,
+        )
         json_str = response.strip()
         if json_str.startswith("```"):
             json_str = json_str.split("```")[1]
@@ -363,9 +377,6 @@ def rule_based_analysis(files_content: dict) -> dict:
     return result
 
 async def generate_plans_and_docs(project: dict, generate_type: str, provider: str) -> dict:
-    api_key = os.environ.get('EMERGENT_LLM_KEY')
-    provider_name, model_name = get_ai_model(provider)
-    
     tech_stack = project.get("detectedTechStack", {})
     build_steps = project.get("buildSteps", {})
     project_name = project.get("name", "my-project")
@@ -392,8 +403,7 @@ Build Steps: Frontend: {build_steps.get('frontendBuild', 'N/A')}, Backend: {buil
 Make each plan comprehensive. Return ONLY valid JSON."""
 
         try:
-            chat = LlmChat(api_key=api_key, session_id=f"plans-{uuid.uuid4()}", system_message="DevOps expert. Return JSON only.").with_model(provider_name, model_name)
-            response = await chat.send_message(UserMessage(text=plans_prompt))
+            response = await call_llm(system_message="DevOps expert. Return JSON only.", prompt=plans_prompt, provider=provider)
             json_str = response.strip()
             if json_str.startswith("```"):
                 json_str = json_str.split("```")[1]
@@ -419,8 +429,7 @@ Make each plan comprehensive. Return ONLY valid JSON."""
 Return ONLY valid JSON."""
 
         try:
-            chat = LlmChat(api_key=api_key, session_id=f"docs-{uuid.uuid4()}", system_message="Technical writer. Return JSON only.").with_model(provider_name, model_name)
-            response = await chat.send_message(UserMessage(text=docs_prompt))
+            response = await call_llm(system_message="Technical writer. Return JSON only.", prompt=docs_prompt, provider=provider)
             json_str = response.strip()
             if json_str.startswith("```"):
                 json_str = json_str.split("```")[1]
@@ -567,31 +576,34 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
     cancel_url = f"{request.originUrl}/pricing"
     
     # Initialize Stripe
-    api_key = os.environ.get('STRIPE_API_KEY')
-    host_url = str(http_request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe.api_key = os.environ.get('STRIPE_API_KEY')
 
-    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
-
-    # Create checkout session
-    checkout_request = CheckoutSessionRequest(
-        amount=amount,
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "user_id": request.userId,
-            "tier": request.tier,
-            "user_email": user.get("email", "")
-        }
+    # Create checkout session (one-time payment in cents)
+    session = await asyncio.to_thread(
+        lambda: stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": f"{SUBSCRIPTION_TIERS[request.tier]['name']} plan"},
+                    "unit_amount": int(round(amount * 100)),
+                },
+                "quantity": 1,
+            }],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "user_id": request.userId,
+                "tier": request.tier,
+                "user_email": user.get("email", ""),
+            },
+        )
     )
-    
-    session = await stripe_checkout.create_checkout_session(checkout_request)
-    
+
     # Create payment transaction record
     transaction = PaymentTransaction(
         userId=request.userId,
-        sessionId=session.session_id,
+        sessionId=session.id,
         tier=request.tier,
         amount=amount,
         currency="usd",
@@ -599,40 +611,38 @@ async def create_checkout_session(request: CheckoutRequest, http_request: Reques
         paymentStatus="initiated",
         metadata={"user_email": user.get("email", "")}
     )
-    
+
     tx_doc = transaction.model_dump()
     tx_doc['createdAt'] = tx_doc['createdAt'].isoformat()
     tx_doc['updatedAt'] = tx_doc['updatedAt'].isoformat()
     await db.payment_transactions.insert_one(tx_doc)
-    
-    return {"url": session.url, "sessionId": session.session_id}
+
+    return {"url": session.url, "sessionId": session.id}
 
 @api_router.get("/checkout/status/{session_id}")
 async def get_checkout_status(session_id: str, http_request: Request):
     """Get checkout session status and update subscription"""
-    api_key = os.environ.get('STRIPE_API_KEY')
-    host_url = str(http_request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-
-    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
+    stripe.api_key = os.environ.get('STRIPE_API_KEY')
 
     try:
-        status = await stripe_checkout.get_checkout_status(session_id)
-        
+        session = await asyncio.to_thread(stripe.checkout.Session.retrieve, session_id)
+        payment_status = session.payment_status  # "paid" / "unpaid" / "no_payment_required"
+        session_status = session.status          # "open" / "complete" / "expired"
+
         # Find the transaction
         transaction = await db.payment_transactions.find_one({"sessionId": session_id}, {"_id": 0})
-        
-        if transaction and status.payment_status == "paid" and transaction.get("status") != "paid":
+
+        if transaction and payment_status == "paid" and transaction.get("status") != "paid":
             # Update transaction
             await db.payment_transactions.update_one(
                 {"sessionId": session_id},
                 {"$set": {
                     "status": "paid",
-                    "paymentStatus": status.payment_status,
+                    "paymentStatus": payment_status,
                     "updatedAt": datetime.now(timezone.utc).isoformat()
                 }}
             )
-            
+
             # Upgrade user subscription
             tier = transaction.get("tier", "pro")
             await db.users.update_one(
@@ -643,17 +653,17 @@ async def get_checkout_status(session_id: str, http_request: Request):
                     "updatedAt": datetime.now(timezone.utc).isoformat()
                 }}
             )
-        elif transaction and status.status == "expired":
+        elif transaction and session_status == "expired":
             await db.payment_transactions.update_one(
                 {"sessionId": session_id},
                 {"$set": {"status": "expired", "updatedAt": datetime.now(timezone.utc).isoformat()}}
             )
-        
+
         return {
-            "status": status.status,
-            "paymentStatus": status.payment_status,
-            "amount": status.amount_total,
-            "currency": status.currency
+            "status": session_status,
+            "paymentStatus": payment_status,
+            "amount": (session.amount_total or 0) / 100,
+            "currency": session.currency
         }
     except Exception as e:
         logger.error(f"Checkout status error: {e}")
@@ -664,31 +674,35 @@ async def stripe_webhook(request: Request):
     """Handle Stripe webhooks"""
     body = await request.body()
     signature = request.headers.get("Stripe-Signature")
-    
-    api_key = os.environ.get('STRIPE_API_KEY')
-    host_url = str(request.base_url).rstrip('/')
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    
-    stripe_checkout = StripeCheckout(api_key=api_key, webhook_url=webhook_url)
-    
+
+    stripe.api_key = os.environ.get('STRIPE_API_KEY')
+    webhook_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
+    if not webhook_secret:
+        logger.error("STRIPE_WEBHOOK_SECRET not configured")
+        return {"status": "error", "message": "Webhook secret not configured"}
+
     try:
-        event = await stripe_checkout.handle_webhook(body, signature)
-        
-        if event.payment_status == "paid":
-            transaction = await db.payment_transactions.find_one({"sessionId": event.session_id}, {"_id": 0})
-            if transaction and transaction.get("status") != "paid":
-                await db.payment_transactions.update_one(
-                    {"sessionId": event.session_id},
-                    {"$set": {"status": "paid", "paymentStatus": "paid", "updatedAt": datetime.now(timezone.utc).isoformat()}}
-                )
-                
-                tier = event.metadata.get("tier", "pro")
-                user_id = event.metadata.get("user_id")
-                if user_id:
-                    await db.users.update_one(
-                        {"id": user_id},
-                        {"$set": {"subscription": tier, "subscriptionStatus": "active", "updatedAt": datetime.now(timezone.utc).isoformat()}}
+        event = stripe.Webhook.construct_event(body, signature, webhook_secret)
+
+        if event["type"] in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+            session = event["data"]["object"]
+            if session.get("payment_status") == "paid":
+                session_id = session["id"]
+                metadata = session.get("metadata") or {}
+                transaction = await db.payment_transactions.find_one({"sessionId": session_id}, {"_id": 0})
+                if transaction and transaction.get("status") != "paid":
+                    await db.payment_transactions.update_one(
+                        {"sessionId": session_id},
+                        {"$set": {"status": "paid", "paymentStatus": "paid", "updatedAt": datetime.now(timezone.utc).isoformat()}}
                     )
+
+                    tier = metadata.get("tier", "pro")
+                    user_id = metadata.get("user_id")
+                    if user_id:
+                        await db.users.update_one(
+                            {"id": user_id},
+                            {"$set": {"subscription": tier, "subscriptionStatus": "active", "updatedAt": datetime.now(timezone.utc).isoformat()}}
+                        )
         
         return {"status": "ok"}
     except Exception as e:
