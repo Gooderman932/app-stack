@@ -1,0 +1,68 @@
+name: Android Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web assets
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_REVENUECAT_GOOGLE_API_KEY: ${{ secrets.VITE_REVENUECAT_GOOGLE_API_KEY }}
+        run: npm run build
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Create keystore from secret
+        run: |
+          mkdir -p keystore
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > keystore/upload-key.jks
+
+      - name: Write keystore.properties
+        run: |
+          cat > android/keystore.properties << PROPS
+          storeFile=../keystore/upload-key.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=upload
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          PROPS
+
+      - name: Configure Android signing
+        run: chmod +x scripts/configure-android-signing.sh && ./scripts/configure-android-signing.sh
+
+      - name: Build Release AAB
+        run: cd android && ./gradlew bundleRelease
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
