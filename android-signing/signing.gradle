@@ -1,0 +1,37 @@
+// Signing config injected into android/app/build.gradle by
+// scripts/configure-android-signing.sh after `npx cap add android`.
+// Reads credentials from android/keystore.properties (gitignored) or from
+// CI environment variables, so no secrets live in source control.
+
+def keystorePropsFile = rootProject.file("keystore.properties")
+def hasKeystoreFile = keystorePropsFile.exists()
+def keystoreProps = new Properties()
+if (hasKeystoreFile) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
+android {
+    signingConfigs {
+        release {
+            if (hasKeystoreFile) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            } else if (System.getenv("ANDROID_KEYSTORE_PASSWORD") != null) {
+                storeFile file("release.keystore")
+                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
