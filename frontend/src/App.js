@@ -570,35 +570,54 @@ const PaymentSuccessPage = () => {
   const { refreshUser } = useUser();
   const navigate = useNavigate();
   const [status, setStatus] = useState("checking");
-  const [attempts, setAttempts] = useState(0);
-  
-  const checkPayment = useCallback(async () => {
+
+  // Drive polling with a ref + a single timer so we don't bake `attempts`
+  // into checkPayment's closure (which previously caused BOTH the setTimeout
+  // chain AND the useEffect to re-fire on every attempt -> double-polling and
+  // "Payment Failed" flicker).
+  useEffect(() => {
     const sessionId = searchParams.get("session_id");
     if (!sessionId) {
       setStatus("error");
-      return;
+      return undefined;
     }
-    
-    try {
-      const res = await axios.get(`${API}/checkout/status/${sessionId}`);
-      if (res.data.paymentStatus === "paid") {
-        setStatus("success");
-        await refreshUser();
-      } else if (res.data.status === "expired") {
-        setStatus("expired");
-      } else if (attempts < 5) {
-        setTimeout(() => setAttempts(a => a + 1), 2000);
-      } else {
-        setStatus("pending");
+
+    let cancelled = false;
+    let attempts = 0;
+    let timer = null;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const res = await axios.get(`${API}/checkout/status/${sessionId}`);
+        if (cancelled) return;
+        if (res.data.paymentStatus === "paid") {
+          setStatus("success");
+          await refreshUser();
+          return;
+        }
+        if (res.data.status === "expired") {
+          setStatus("expired");
+          return;
+        }
+        if (attempts < 5) {
+          attempts += 1;
+          timer = setTimeout(poll, 2000);
+        } else {
+          setStatus("pending");
+        }
+      } catch (e) {
+        if (!cancelled) setStatus("error");
       }
-    } catch (e) {
-      setStatus("error");
-    }
-  }, [searchParams, refreshUser, attempts]);
-  
-  useEffect(() => {
-    checkPayment();
-  }, [checkPayment]);
+    };
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [searchParams, refreshUser]);
   
   return (
     <div className="container max-w-lg py-16 px-4">
