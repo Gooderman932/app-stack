@@ -1,6 +1,10 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from rate_limit import limiter, check_and_consume_gemini_quota
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
@@ -45,6 +49,8 @@ PLAY_PRODUCT_TIERS = {
 
 # Create the main app
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 api_router = APIRouter(prefix="/api")
 
 # Configure logging
@@ -712,7 +718,8 @@ async def upload_file(project_id: str, file: UploadFile = File(...)):
     return {"message": "File uploaded", "fileId": file_id}
 
 @api_router.post("/projects/{project_id}/analyze")
-async def analyze_project(project_id: str, reanalyze: bool = False):
+@limiter.limit("10/minute")
+async def analyze_project(request: Request, project_id: str, reanalyze: bool = False):
     project = await db.projects.find_one({"id": project_id}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -722,6 +729,17 @@ async def analyze_project(project_id: str, reanalyze: bool = False):
     # Check re-analyze limit
     if reanalyze and user_id and not await check_reanalyze_access(user_id, project_id):
         raise HTTPException(status_code=403, detail="Re-analysis limit reached. Upgrade to Pro for unlimited re-analysis.")
+
+    # Per-user daily Gemini quota (tier-aware).
+    if user_id:
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "tier": 1})
+        tier = (user or {}).get("tier", "free")
+        allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily AI quota exceeded ({used}/{quota}). Resets at 00:00 UTC.",
+            )
     
     files_content = {}
     
@@ -755,7 +773,8 @@ async def analyze_project(project_id: str, reanalyze: bool = False):
     return {**project, **update_data}
 
 @api_router.post("/projects/{project_id}/generate")
-async def generate_content(project_id: str, request: GenerateRequest):
+@limiter.limit("10/minute")
+async def generate_content(http_request: Request, project_id: str, request: GenerateRequest):
     project = await db.projects.find_one({"id": project_id}, {"_id": 0})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
