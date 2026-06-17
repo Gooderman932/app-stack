@@ -1,3 +1,6 @@
+import sys
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -8,6 +11,7 @@ from rate_limit import limiter, check_and_consume_gemini_quota
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import re
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
@@ -30,10 +34,18 @@ from google.auth.transport import requests as google_requests
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+# MongoDB connection. Use .get() with a clear error so a missing env var fails
+# at startup with a helpful message instead of raising KeyError mid-import.
+mongo_url = os.environ.get('MONGO_URL')
+db_name = os.environ.get('DB_NAME')
+if not mongo_url or not db_name:
+    sys.stderr.write(
+        "FATAL: MONGO_URL and DB_NAME environment variables are required.\n"
+    )
+    raise SystemExit(1)
+
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[db_name]
 
 # Gemini model used for all AI generation (overridable via env)
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
@@ -47,11 +59,47 @@ PLAY_PRODUCT_TIERS = {
     "team": "team",
 }
 
-# Create the main app
-app = FastAPI()
+# Create the main app using a lifespan context manager. @app.on_event is
+# deprecated in FastAPI >=0.93 and slated for removal; lifespan is the
+# current way to wire startup/shutdown hooks.
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # startup: nothing to do today
+    yield
+    # shutdown: close the Mongo client
+    client.close()
+
+
+app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 api_router = APIRouter(prefix="/api")
+
+
+_JSON_FENCE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+
+
+def _strip_json_fence(text: str) -> str:
+    """Remove a leading/trailing ```json ... ``` fence from an LLM response.
+
+    The previous in-line logic only stripped the *leading* fence: it split on
+    '```' and took element [1], but never trimmed the trailing fence, so
+    json.loads always failed when the model used a code fence and the API
+    silently fell back to the rule-based stub.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    match = _JSON_FENCE.match(text)
+    if match:
+        return match.group(1).strip()
+    # Fallback: trim only obvious leading ``` / ```json markers
+    if text.startswith("```"):
+        text = text.split("```", 2)[-1] if text.count("```") >= 2 else text.lstrip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip().rstrip("`").strip()
+    return text
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -349,13 +397,9 @@ Return ONLY valid JSON."""
             prompt=prompt,
             provider=provider,
         )
-        json_str = response.strip()
-        if json_str.startswith("```"):
-            json_str = json_str.split("```")[1]
-            if json_str.startswith("json"):
-                json_str = json_str[4:]
-        
-        return json.loads(json_str.strip())
+        json_str = _strip_json_fence(response)
+
+        return json.loads(json_str)
     except Exception as e:
         logger.error(f"AI analysis error: {e}")
         return rule_based_analysis(files_content)
@@ -420,12 +464,8 @@ Make each plan comprehensive. Return ONLY valid JSON."""
 
         try:
             response = await call_llm(system_message="DevOps expert. Return JSON only.", prompt=plans_prompt, provider=provider)
-            json_str = response.strip()
-            if json_str.startswith("```"):
-                json_str = json_str.split("```")[1]
-                if json_str.startswith("json"):
-                    json_str = json_str[4:]
-            result["deploymentPlans"] = json.loads(json_str.strip())
+            json_str = _strip_json_fence(response)
+            result["deploymentPlans"] = json.loads(json_str)
         except Exception as e:
             logger.error(f"Plans generation error: {e}")
             result["deploymentPlans"] = generate_fallback_plans(project_name, tech_stack, build_steps)
@@ -446,12 +486,8 @@ Return ONLY valid JSON."""
 
         try:
             response = await call_llm(system_message="Technical writer. Return JSON only.", prompt=docs_prompt, provider=provider)
-            json_str = response.strip()
-            if json_str.startswith("```"):
-                json_str = json_str.split("```")[1]
-                if json_str.startswith("json"):
-                    json_str = json_str[4:]
-            result["docs"] = json.loads(json_str.strip())
+            json_str = _strip_json_fence(response)
+            result["docs"] = json.loads(json_str)
         except Exception as e:
             logger.error(f"Docs generation error: {e}")
             result["docs"] = generate_fallback_docs(project_name, tech_stack, build_steps)
@@ -574,13 +610,36 @@ async def auth_with_google(request: Request):
     return user_dict
 
 # --- Google Play Billing ---
-def _play_publisher():
-    """Build an authenticated Android Publisher API client from a service account."""
+# Cache the authenticated client so we don't rebuild credentials on every call.
+_play_publisher_lock = asyncio.Lock()
+_play_publisher_instance = None
+
+
+def _build_play_publisher():
+    """Synchronous builder — expensive (cred file read + HTTP discovery doc)."""
     creds = google_service_account.Credentials.from_service_account_file(
         PLAY_SERVICE_ACCOUNT_FILE,
         scopes=["https://www.googleapis.com/auth/androidpublisher"],
     )
-    return google_api_build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
+    return google_api_build(
+        "androidpublisher", "v3", credentials=creds, cache_discovery=False
+    )
+
+
+async def _play_publisher():
+    """Return a cached Android Publisher API client, building it off-loop.
+
+    Previously this was a sync function called *inside* the async endpoint, so
+    every request did the credential read + discovery doc fetch on the event
+    loop. Now we cache + use asyncio.to_thread for the first build.
+    """
+    global _play_publisher_instance
+    if _play_publisher_instance is not None:
+        return _play_publisher_instance
+    async with _play_publisher_lock:
+        if _play_publisher_instance is None:
+            _play_publisher_instance = await asyncio.to_thread(_build_play_publisher)
+    return _play_publisher_instance
 
 
 @api_router.post("/billing/verify")
@@ -599,7 +658,7 @@ async def verify_play_purchase(request: PlayVerifyRequest):
 
     # Validate the purchase token against the Play Developer API (subscriptions v2)
     try:
-        service = _play_publisher()
+        service = await _play_publisher()
         result = await asyncio.to_thread(
             lambda: service.purchases().subscriptionsv2().get(
                 packageName=PLAY_PACKAGE_NAME,
@@ -642,6 +701,36 @@ async def verify_play_purchase(request: PlayVerifyRequest):
     )
 
     return {"status": "active", "tier": tier}
+
+
+@api_router.get("/checkout/status/{session_id}")
+async def get_checkout_status(session_id: str):
+    """Return the status of a checkout session.
+
+    The frontend's PaymentSuccessPage polls this endpoint after the user
+    returns from the payment provider. Previously this route did not exist,
+    so the frontend always rendered 'Payment Failed'.
+
+    Resolution: look up the payment_transactions row that the Play verify
+    endpoint (and any future Stripe webhook) writes by sessionId.
+    """
+    tx = await db.payment_transactions.find_one(
+        {"sessionId": session_id}, {"_id": 0}
+    )
+    if not tx:
+        # No record yet — frontend should keep polling for a bounded number of
+        # attempts. We respond 200 with a pending status so the polling loop
+        # is driven by data, not HTTP errors.
+        return {"sessionId": session_id, "status": "pending", "paymentStatus": "pending"}
+    return {
+        "sessionId": session_id,
+        "status": tx.get("status", "pending"),
+        "paymentStatus": tx.get("paymentStatus", tx.get("status", "pending")),
+        "tier": tx.get("tier"),
+        "amount": tx.get("amount"),
+        "currency": tx.get("currency"),
+    }
+
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])
@@ -840,6 +929,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# Shutdown is handled by the `lifespan` context manager above. The old
+# @app.on_event("shutdown") hook is deprecated in FastAPI >=0.93 and was
+# removed in favor of the lifespan API.
