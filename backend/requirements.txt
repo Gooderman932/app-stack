@@ -50,7 +50,7 @@ jmespath==1.0.1
 jq==1.10.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-litellm==1.80.0
+litellm==1.83.7
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 mccabe==0.7.0
