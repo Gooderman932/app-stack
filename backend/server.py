@@ -821,8 +821,8 @@ async def analyze_project(request: Request, project_id: str, reanalyze: bool = F
 
     # Per-user daily Gemini quota (tier-aware).
     if user_id:
-        user = await db.users.find_one({"id": user_id}, {"_id": 0, "tier": 1})
-        tier = (user or {}).get("tier", "free")
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
+        tier = (user or {}).get("subscription", "free")
         allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
         if not allowed:
             raise HTTPException(
@@ -870,6 +870,18 @@ async def generate_content(http_request: Request, project_id: str, request: Gene
     
     if project["status"] == "pending":
         raise HTTPException(status_code=400, detail="Project must be analyzed first")
+    
+    # Per-user daily Gemini quota (tier-aware) — same accounting as /analyze.
+    user_id = project.get("userId")
+    if user_id:
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
+        tier = (user or {}).get("subscription", "free")
+        allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily AI quota exceeded ({used}/{quota}). Resets at 00:00 UTC.",
+            )
     
     result = await generate_plans_and_docs(project, request.generateType, project.get("aiProvider", "gemini"))
     
