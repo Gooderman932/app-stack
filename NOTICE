@@ -1,0 +1,18 @@
+NOTICE
+
+App Stack (AI app generator)
+Copyright (c) 2026 Poor Dude Holdings LLC. All rights reserved.
+
+This software is proprietary and confidential. It is licensed only under a
+separate written agreement with the owner. See LICENSE.
+
+Third-party software
+--------------------
+This project uses open-source packages listed in its dependency
+manifests (frontend/package.json, backend/requirements.txt). Each package
+remains under its own license, and its copyright notices are retained in
+the installed package. No third-party code is relicensed by this NOTICE.
+
+IP register for this repository: INTELLECTUAL_PROPERTY.md
+Account-wide IP registry: Gooderman932/business_database → ip-registry/IP_REGISTRY.md
+Contact: admin@poordudeholdings.com
