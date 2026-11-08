@@ -34,27 +34,20 @@ import {
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
-// Session token issued by POST /auth/google. Sent as a bearer token on every
-// API call; the server checks it on all user-specific routes.
-const SESSION_KEY = "sessionToken";
-const readSession = () => {
-  try { return localStorage.getItem(SESSION_KEY); } catch { return null; }
+// Session token issued by POST /api/auth/google after Google verifies the
+// ID token. It is sent as `Authorization: Bearer <token>` on every API
+// call; the backend derives the user from the token and never trusts a
+// client-supplied userId/email. (The old email-only POST /api/users login
+// was removed server-side — anyone could log in as anyone by email.)
+const getSessionToken = () => {
+  try { return localStorage.getItem("sessionToken"); } catch { return null; }
 };
-const writeSession = (token) => {
-  try {
-    if (token) localStorage.setItem(SESSION_KEY, token);
-    else localStorage.removeItem(SESSION_KEY);
-    localStorage.removeItem("userEmail"); // legacy email-only sign-in
-  } catch { /* storage unavailable: session lasts for this page only */ }
+const applyAuthHeader = () => {
+  const token = getSessionToken();
+  if (token) axios.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+  else delete axios.defaults.headers.common["Authorization"];
 };
-axios.interceptors.request.use((config) => {
-  const token = readSession();
-  if (token && config.url && config.url.startsWith(API)) {
-    config.headers = config.headers || {};
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
+applyAuthHeader();
 
 // True when running inside the native Android (Capacitor) app rather than a browser.
 const IS_NATIVE = Capacitor.isNativePlatform();
@@ -77,24 +70,20 @@ const UserProvider = ({ children }) => {
   const [loading, setLoading] = useState(true);
   
   useEffect(() => {
-    if (readSession()) {
+    if (getSessionToken()) {
       fetchUser();
     } else {
-      writeSession(null);
       setLoading(false);
     }
   }, []);
-  
+
   const fetchUser = async () => {
     try {
-      const res = await axios.get(`${API}/auth/me`);
+      const res = await axios.get(`${API}/users/me`);
       setUser(res.data);
     } catch (e) {
-      // Expired or revoked session: sign out locally.
-      if (e?.response?.status === 401) {
-        writeSession(null);
-        setUser(null);
-      }
+      localStorage.removeItem("sessionToken");
+      applyAuthHeader();
     } finally {
       setLoading(false);
     }
@@ -103,24 +92,26 @@ const UserProvider = ({ children }) => {
   const loginWithGoogle = async (credential) => {
     try {
       const res = await axios.post(`${API}/auth/google`, { credential });
-      const { sessionToken, ...profile } = res.data;
-      writeSession(sessionToken);
-      setUser(profile);
-      return profile;
+      if (res.data.sessionToken) {
+        localStorage.setItem("sessionToken", res.data.sessionToken);
+        applyAuthHeader();
+      }
+      setUser(res.data);
+      return res.data;
     } catch (e) {
       toast.error("Google login failed");
       return null;
     }
   };
 
-  const logout = async () => {
-    try { await axios.post(`${API}/auth/logout`); } catch { /* already signed out */ }
-    writeSession(null);
+  const logout = () => {
     setUser(null);
+    localStorage.removeItem("sessionToken");
+    applyAuthHeader();
   };
-  
+
   const refreshUser = async () => {
-    if (readSession()) {
+    if (user) {
       await fetchUser();
     }
   };
@@ -280,7 +271,7 @@ const LoginDialog = ({ open, onOpenChange }) => {
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Welcome to StackPilot</DialogTitle>
-          <DialogDescription>Sign in to get started</DialogDescription>
+          <DialogDescription>Sign in with Google to get started</DialogDescription>
         </DialogHeader>
 
         {IS_NATIVE ? (
@@ -291,8 +282,9 @@ const LoginDialog = ({ open, onOpenChange }) => {
         ) : GOOGLE_CLIENT_ID ? (
           <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
         ) : (
-          <p className="text-sm text-muted-foreground" data-testid="signin-unavailable">
-            Sign-in is not set up on this site yet. Set REACT_APP_GOOGLE_CLIENT_ID to enable Google sign-in.
+          <p className="text-sm text-muted-foreground">
+            Google sign-in is not configured yet. Set REACT_APP_GOOGLE_CLIENT_ID
+            (and the matching backend GOOGLE_CLIENT_ID) to enable sign-in.
           </p>
         )}
       </DialogContent>
@@ -670,10 +662,7 @@ const HomePage = () => {
   
   const fetchProjects = async () => {
     try {
-      if (!user) {
-        setProjects([]);
-        return;
-      }
+      // Backend scopes the list to the session-token user; no userId param.
       const res = await axios.get(`${API}/projects`);
       setProjects(res.data);
     } catch (e) {
@@ -852,13 +841,11 @@ const InputProjectPage = () => {
     if (formData.sourceType === "upload" && !uploadedFile) { toast.error("Upload a ZIP file"); return; }
     if (formData.sourceType === "text_only" && !formData.textDescription.trim()) { toast.error("Project description required for text-only mode"); return; }
     
-    if (!user) { toast.error("Sign in to create a project"); return; }
-    
     setLoading(true);
     setProgress(10);
     
     try {
-      const projectRes = await axios.post(`${API}/projects`, formData);
+      const projectRes = await axios.post(`${API}/projects`, { ...formData });
       const projectId = projectRes.data.id;
       setProgress(30);
       
