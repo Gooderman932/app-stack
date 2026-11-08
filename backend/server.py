@@ -24,6 +24,9 @@ import json
 import aiofiles
 import tempfile
 import asyncio
+import hashlib
+import secrets
+from datetime import timedelta
 from google import genai
 from google.genai import types
 from google.oauth2 import id_token
@@ -64,7 +67,12 @@ PLAY_PRODUCT_TIERS = {
 # current way to wire startup/shutdown hooks.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # startup: nothing to do today
+    # startup: session lookups by token hash; Mongo deletes expired sessions.
+    try:
+        await db.sessions.create_index("tokenHash", unique=True)
+        await db.sessions.create_index("expiresAt", expireAfterSeconds=0)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Could not create session indexes: {e}")
     yield
     # shutdown: close the Mongo client
     client.close()
@@ -519,52 +527,109 @@ def generate_fallback_docs(name: str, tech_stack: dict, build_steps: dict) -> di
 async def root():
     return {"message": "Deployment & Docs Copilot API"}
 
+# --- Sessions ---
+# Google sign-in is verified once at /auth/google, which then issues an opaque
+# session token. Every user-specific route requires that token as
+# "Authorization: Bearer <token>". Only a SHA-256 hash of it is stored.
+SESSION_TTL_DAYS = int(os.environ.get('SESSION_TTL_DAYS', '30'))
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+
+async def create_session(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    await db.sessions.insert_one({
+        "tokenHash": _hash_token(token),
+        "userId": user_id,
+        "createdAt": now,
+        "expiresAt": now + timedelta(days=SESSION_TTL_DAYS),
+    })
+    return token
+
+
+def _bearer_token(request: Request) -> Optional[str]:
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:].strip() or None
+    return None
+
+
+async def get_current_user(request: Request) -> Optional[dict]:
+    token = _bearer_token(request)
+    if not token:
+        return None
+    session = await db.sessions.find_one({"tokenHash": _hash_token(token)})
+    if not session:
+        return None
+    expires_at = session.get("expiresAt")
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        return None
+    return await db.users.find_one({"id": session["userId"]}, {"_id": 0})
+
+
+async def require_user(request: Request) -> dict:
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    return user
+
+
+async def require_own_project(request: Request, project_id: str) -> tuple:
+    """Return (user, project) when the signed-in user owns the project.
+
+    Someone else's project answers 404, the same as a missing one, so project
+    ids cannot be probed.
+    """
+    user = await require_user(request)
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project or project.get("userId") != user["id"]:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return user, project
+
+
+async def _user_view(user: dict) -> dict:
+    user = dict(user)
+    user["projectCount"] = await db.projects.count_documents({"userId": user["id"]})
+    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
+    return user
+
+
 # --- User & Subscription Routes ---
 @api_router.get("/tiers")
 async def get_tiers():
     """Get all subscription tiers"""
     return SUBSCRIPTION_TIERS
 
-@api_router.post("/users", response_model=User)
-async def create_or_get_user(user_data: UserCreate):
-    """Create or get existing user"""
-    existing = await db.users.find_one({"email": user_data.email}, {"_id": 0})
-    if existing:
-        return existing
-    
-    user = User(email=user_data.email, name=user_data.name)
-    doc = user.model_dump()
-    doc['createdAt'] = doc['createdAt'].isoformat()
-    doc['updatedAt'] = doc['updatedAt'].isoformat()
-    await db.users.insert_one(doc)
-    return user
+# Email-only sign-in (POST /users, GET /users/email/{email}) was removed: it
+# let anyone sign in as anyone by typing their address. Google sign-in is the
+# only way in.
 
 @api_router.get("/users/{user_id}")
-async def get_user(user_id: str):
-    """Get user by ID"""
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
-    if not user:
+async def get_user(user_id: str, request: Request):
+    """Get the signed-in user's own record"""
+    user = await require_user(request)
+    if user["id"] != user_id:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Get project count
-    project_count = await db.projects.count_documents({"userId": user_id})
-    user["projectCount"] = project_count
-    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
-    
-    return user
+    return await _user_view(user)
 
-@api_router.get("/users/email/{email}")
-async def get_user_by_email(email: str):
-    """Get user by email"""
-    user = await db.users.find_one({"email": email}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    project_count = await db.projects.count_documents({"userId": user["id"]})
-    user["projectCount"] = project_count
-    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
-    
-    return user
+
+@api_router.get("/auth/me")
+async def get_me(request: Request):
+    """Return the signed-in user"""
+    return await _user_view(await require_user(request))
+
+
+@api_router.post("/auth/logout")
+async def logout(request: Request):
+    token = _bearer_token(request)
+    if token:
+        await db.sessions.delete_one({"tokenHash": _hash_token(token)})
+    return {"message": "Signed out"}
 
 # --- Google OAuth Route ---
 @api_router.post("/auth/google")
@@ -591,22 +656,21 @@ async def auth_with_google(request: Request):
     email = idinfo["email"]
     name = idinfo.get("name", email.split("@")[0])
 
+    if not idinfo.get("email_verified", False):
+        raise HTTPException(status_code=401, detail="Google account email is not verified")
+
     existing = await db.users.find_one({"email": email}, {"_id": 0})
     if existing:
-        project_count = await db.projects.count_documents({"userId": existing["id"]})
-        existing["projectCount"] = project_count
-        existing["tierLimits"] = SUBSCRIPTION_TIERS.get(existing.get("subscription", "free"))
-        return existing
+        user_dict = await _user_view(existing)
+    else:
+        user = User(email=email, name=name)
+        doc = user.model_dump()
+        doc["createdAt"] = doc["createdAt"].isoformat()
+        doc["updatedAt"] = doc["updatedAt"].isoformat()
+        await db.users.insert_one(dict(doc))  # insert_one adds _id to the dict it gets
+        user_dict = await _user_view(doc)
 
-    user = User(email=email, name=name)
-    doc = user.model_dump()
-    doc["createdAt"] = doc["createdAt"].isoformat()
-    doc["updatedAt"] = doc["updatedAt"].isoformat()
-    await db.users.insert_one(doc)
-
-    user_dict = user.model_dump()
-    user_dict["projectCount"] = 0
-    user_dict["tierLimits"] = SUBSCRIPTION_TIERS["free"]
+    user_dict["sessionToken"] = await create_session(user_dict["id"])
     return user_dict
 
 # --- Google Play Billing ---
@@ -643,8 +707,11 @@ async def _play_publisher():
 
 
 @api_router.post("/billing/verify")
-async def verify_play_purchase(request: PlayVerifyRequest):
+async def verify_play_purchase(request: PlayVerifyRequest, http_request: Request):
     """Verify a Google Play subscription purchase token and grant the matching tier."""
+    current = await require_user(http_request)
+    if request.userId != current["id"]:
+        raise HTTPException(status_code=403, detail="Purchases can only be applied to your own account")
     if not PLAY_SERVICE_ACCOUNT_FILE:
         raise HTTPException(status_code=500, detail="Play billing not configured on this server")
 
@@ -652,9 +719,12 @@ async def verify_play_purchase(request: PlayVerifyRequest):
     if not tier:
         raise HTTPException(status_code=400, detail="Unknown product")
 
-    user = await db.users.find_one({"id": request.userId}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    # One purchase unlocks one account: refuse a token already used by another.
+    prior = await db.payment_transactions.find_one(
+        {"sessionId": request.purchaseToken}, {"_id": 0, "userId": 1}
+    )
+    if prior and prior.get("userId") not in (None, request.userId):
+        raise HTTPException(status_code=409, detail="This purchase belongs to another account")
 
     # Validate the purchase token against the Play Developer API (subscriptions v2)
     try:
@@ -704,7 +774,7 @@ async def verify_play_purchase(request: PlayVerifyRequest):
 
 
 @api_router.get("/checkout/status/{session_id}")
-async def get_checkout_status(session_id: str):
+async def get_checkout_status(session_id: str, request: Request):
     """Return the status of a checkout session.
 
     The frontend's PaymentSuccessPage polls this endpoint after the user
@@ -714,8 +784,9 @@ async def get_checkout_status(session_id: str):
     Resolution: look up the payment_transactions row that the Play verify
     endpoint (and any future Stripe webhook) writes by sessionId.
     """
+    user = await require_user(request)
     tx = await db.payment_transactions.find_one(
-        {"sessionId": session_id}, {"_id": 0}
+        {"sessionId": session_id, "userId": user["id"]}, {"_id": 0}
     )
     if not tx:
         # No record yet — frontend should keep polling for a bounded number of
@@ -734,11 +805,14 @@ async def get_checkout_status(session_id: str):
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])
-async def get_projects(userId: Optional[str] = None):
-    """Get all projects, optionally filtered by user"""
-    query = {}
-    if userId:
-        query["userId"] = userId
+async def get_projects(request: Request, userId: Optional[str] = None):
+    """Get the signed-in user's projects.
+
+    The userId query parameter is accepted for older clients but ignored:
+    the list always comes from the session.
+    """
+    user = await require_user(request)
+    query = {"userId": user["id"]}
     
     projects = await db.projects.find(query, {"_id": 0}).sort("createdAt", -1).to_list(100)
     for p in projects:
@@ -749,15 +823,14 @@ async def get_projects(userId: Optional[str] = None):
     return projects
 
 @api_router.get("/projects/{project_id}")
-async def get_project(project_id: str):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def get_project(project_id: str, request: Request):
+    _, project = await require_own_project(request, project_id)
     return project
 
 @api_router.post("/projects", response_model=Project)
-async def create_project(project_data: ProjectCreate):
-    user_id = project_data.userId
+async def create_project(project_data: ProjectCreate, request: Request):
+    # The owner comes from the session, never from the request body.
+    user_id = (await require_user(request))["id"]
     
     # Check project limit
     if user_id and not await check_project_limit(user_id):
@@ -789,7 +862,8 @@ async def create_project(project_data: ProjectCreate):
     return project
 
 @api_router.post("/projects/{project_id}/upload")
-async def upload_file(project_id: str, file: UploadFile = File(...)):
+async def upload_file(project_id: str, request: Request, file: UploadFile = File(...)):
+    await require_own_project(request, project_id)
     content = await file.read()
     file_id = str(uuid.uuid4())
     temp_dir = Path(tempfile.gettempdir()) / "copilot_uploads"
@@ -809,9 +883,7 @@ async def upload_file(project_id: str, file: UploadFile = File(...)):
 @api_router.post("/projects/{project_id}/analyze")
 @limiter.limit("10/minute")
 async def analyze_project(request: Request, project_id: str, reanalyze: bool = False):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    _, project = await require_own_project(request, project_id)
     
     user_id = project.get("userId")
     
@@ -864,9 +936,7 @@ async def analyze_project(request: Request, project_id: str, reanalyze: bool = F
 @api_router.post("/projects/{project_id}/generate")
 @limiter.limit("10/minute")
 async def generate_content(http_request: Request, project_id: str, request: GenerateRequest):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    _, project = await require_own_project(http_request, project_id)
     
     if project["status"] == "pending":
         raise HTTPException(status_code=400, detail="Project must be analyzed first")
@@ -904,11 +974,9 @@ async def generate_content(http_request: Request, project_id: str, request: Gene
     return {**project, **update_data}
 
 @api_router.get("/projects/{project_id}/can-export")
-async def check_can_export(project_id: str):
+async def check_can_export(project_id: str, request: Request):
     """Check if user can export this project"""
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    _, project = await require_own_project(request, project_id)
     
     user_id = project.get("userId")
     can_export = await check_export_access(user_id) if user_id else False
@@ -916,12 +984,10 @@ async def check_can_export(project_id: str):
     return {"canExport": can_export}
 
 @api_router.delete("/projects/{project_id}")
-async def delete_project(project_id: str):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def delete_project(project_id: str, request: Request):
+    _, project = await require_own_project(request, project_id)
     
-    result = await db.projects.delete_one({"id": project_id})
+    await db.projects.delete_one({"id": project_id, "userId": project["userId"]})
     
     # Update user project count
     user_id = project.get("userId")
@@ -935,10 +1001,12 @@ app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # Sign-in uses a bearer token, not cookies, so credentials are off.
+    # No wildcard fallback: unset CORS_ORIGINS means no browser origin.
+    allow_credentials=False,
+    allow_origins=[o.strip() for o in os.environ.get('CORS_ORIGINS', '').split(',') if o.strip() and o.strip() != '*'],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Shutdown is handled by the `lifespan` context manager above. The old
