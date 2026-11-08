@@ -11,8 +11,8 @@ jobs:
     name: Backend (Python)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -38,6 +38,7 @@ jobs:
         working-directory: backend
         run: |
           if compgen -G "test_*.py" > /dev/null || compgen -G "tests/*.py" > /dev/null; then
+            pip install 'mongomock-motor<0.0.30'
             pytest -q
           else
             echo "no tests yet — skipping"
@@ -47,8 +48,8 @@ jobs:
     name: Frontend (CRA / craco)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: 'npm'
@@ -69,7 +70,7 @@ jobs:
     name: Secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Scan for tracked secrets
         run: |
           set -euo pipefail

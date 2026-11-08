@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# NOTE (Nov 2026 auth fix): this live-server script predates authentication.
+# It tests removed endpoints (POST /api/users, POST /api/checkout/create —
+# neither exists anymore) and calls project/billing routes unauthenticated,
+# so it WILL FAIL against the current server. Use tests/test_auth.py
+# (pytest, no live services needed) instead; do not "fix" this script by
+# re-adding the removed endpoints.
 
 import requests
 import sys

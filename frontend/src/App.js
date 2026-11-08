@@ -34,6 +34,21 @@ import {
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// Session token issued by POST /api/auth/google after Google verifies the
+// ID token. It is sent as `Authorization: Bearer <token>` on every API
+// call; the backend derives the user from the token and never trusts a
+// client-supplied userId/email. (The old email-only POST /api/users login
+// was removed server-side — anyone could log in as anyone by email.)
+const getSessionToken = () => {
+  try { return localStorage.getItem("sessionToken"); } catch { return null; }
+};
+const applyAuthHeader = () => {
+  const token = getSessionToken();
+  if (token) axios.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+  else delete axios.defaults.headers.common["Authorization"];
+};
+applyAuthHeader();
+
 // True when running inside the native Android (Capacitor) app rather than a browser.
 const IS_NATIVE = Capacitor.isNativePlatform();
 
@@ -55,42 +70,33 @@ const UserProvider = ({ children }) => {
   const [loading, setLoading] = useState(true);
   
   useEffect(() => {
-    const savedEmail = localStorage.getItem("userEmail");
-    if (savedEmail) {
-      fetchUser(savedEmail);
+    if (getSessionToken()) {
+      fetchUser();
     } else {
       setLoading(false);
     }
   }, []);
-  
-  const fetchUser = async (email) => {
+
+  const fetchUser = async () => {
     try {
-      const res = await axios.get(`${API}/users/email/${email}`);
+      const res = await axios.get(`${API}/users/me`);
       setUser(res.data);
     } catch (e) {
-      localStorage.removeItem("userEmail");
+      localStorage.removeItem("sessionToken");
+      applyAuthHeader();
     } finally {
       setLoading(false);
-    }
-  };
-  
-  const login = async (email, name) => {
-    try {
-      const res = await axios.post(`${API}/users`, { email, name });
-      setUser(res.data);
-      localStorage.setItem("userEmail", email);
-      return res.data;
-    } catch (e) {
-      toast.error("Failed to login");
-      return null;
     }
   };
 
   const loginWithGoogle = async (credential) => {
     try {
       const res = await axios.post(`${API}/auth/google`, { credential });
+      if (res.data.sessionToken) {
+        localStorage.setItem("sessionToken", res.data.sessionToken);
+        applyAuthHeader();
+      }
       setUser(res.data);
-      localStorage.setItem("userEmail", res.data.email);
       return res.data;
     } catch (e) {
       toast.error("Google login failed");
@@ -100,17 +106,18 @@ const UserProvider = ({ children }) => {
 
   const logout = () => {
     setUser(null);
-    localStorage.removeItem("userEmail");
+    localStorage.removeItem("sessionToken");
+    applyAuthHeader();
   };
-  
+
   const refreshUser = async () => {
-    if (user?.email) {
-      await fetchUser(user.email);
+    if (user) {
+      await fetchUser();
     }
   };
   
   return (
-    <UserContext.Provider value={{ user, loading, login, loginWithGoogle, logout, refreshUser }}>
+    <UserContext.Provider value={{ user, loading, loginWithGoogle, logout, refreshUser }}>
       {children}
     </UserContext.Provider>
   );
@@ -181,9 +188,7 @@ const Header = () => {
 
 // Login Dialog
 const LoginDialog = ({ open, onOpenChange }) => {
-  const { login, loginWithGoogle } = useUser();
-  const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const { loginWithGoogle } = useUser();
   const [loading, setLoading] = useState(false);
   const googleButtonRef = useRef(null);
   const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
@@ -261,63 +266,27 @@ const LoginDialog = ({ open, onOpenChange }) => {
     }
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!email) return;
-    setLoading(true);
-    const result = await login(email, name);
-    setLoading(false);
-    if (result) {
-      toast.success("Welcome!");
-      onOpenChange(false);
-    }
-  };
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Welcome to StackPilot</DialogTitle>
-          <DialogDescription>Sign in to get started</DialogDescription>
+          <DialogDescription>Sign in with Google to get started</DialogDescription>
         </DialogHeader>
 
         {IS_NATIVE ? (
-          <>
-            <Button variant="outline" className="w-full" onClick={handleNativeGoogle} disabled={loading} data-testid="google-signin-native">
-              {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              Continue with Google
-            </Button>
-            <div className="relative flex items-center gap-3">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground">or continue with email</span>
-              <Separator className="flex-1" />
-            </div>
-          </>
-        ) : GOOGLE_CLIENT_ID ? (
-          <>
-            <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
-            <div className="relative flex items-center gap-3">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground">or continue with email</span>
-              <Separator className="flex-1" />
-            </div>
-          </>
-        ) : null}
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <Label>Email *</Label>
-            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" data-testid="login-email" />
-          </div>
-          <div className="space-y-2">
-            <Label>Name (optional)</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" data-testid="login-name" />
-          </div>
-          <Button type="submit" className="w-full" disabled={loading || !email} data-testid="login-submit">
+          <Button variant="outline" className="w-full" onClick={handleNativeGoogle} disabled={loading} data-testid="google-signin-native">
             {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-            Continue
+            Continue with Google
           </Button>
-        </form>
+        ) : GOOGLE_CLIENT_ID ? (
+          <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            Google sign-in is not configured yet. Set REACT_APP_GOOGLE_CLIENT_ID
+            (and the matching backend GOOGLE_CLIENT_ID) to enable sign-in.
+          </p>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -693,8 +662,8 @@ const HomePage = () => {
   
   const fetchProjects = async () => {
     try {
-      const url = user ? `${API}/projects?userId=${user.id}` : `${API}/projects`;
-      const res = await axios.get(url);
+      // Backend scopes the list to the session-token user; no userId param.
+      const res = await axios.get(`${API}/projects`);
       setProjects(res.data);
     } catch (e) {
       toast.error("Failed to load projects");
@@ -876,7 +845,7 @@ const InputProjectPage = () => {
     setProgress(10);
     
     try {
-      const projectRes = await axios.post(`${API}/projects`, { ...formData, userId: user?.id });
+      const projectRes = await axios.post(`${API}/projects`, { ...formData });
       const projectId = projectRes.data.id;
       setProgress(30);
       

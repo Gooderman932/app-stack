@@ -9,7 +9,7 @@ This is a template privacy policy. Customize the highlighted sections (`<<...>>`
 
 - **Account data:** name, email, hashed password, account creation timestamp.
 - **Application data:** <<list app-specific collected fields>> (e.g., meal preferences, case records, estimates, market-data queries).
-- **Payment data:** processed by Stripe / RevenueCat / Google Play / Apple. We never store full card numbers; we store only Stripe customer IDs and last-4 digits where displayed.
+- **Payment data:** processed by Google Play Billing. We never store full card numbers; we store only the Play purchase token / transaction record needed to verify the subscription.
 - **Telemetry:** request logs, error traces, device identifiers (used for fraud prevention and performance debugging).
 - **Sensitive categories** (where applicable): <<PHI, financial, government CUI — listed per app>>.
 
@@ -25,7 +25,7 @@ This is a template privacy policy. Customize the highlighted sections (`<<...>>`
 | Category | Retention |
 |----------|-----------|
 | Account data | While account is active + 30 days after deletion request |
-| Payment records | 7 years (IRS / Stripe requirements) |
+| Payment records | 7 years (IRS / Google Play requirements) |
 | Audit logs | 7 years (regulatory minimum) |
 | Application data | <<per-app, default 2 years inactivity>> |
 | PHI (if applicable) | 6 years minimum (HIPAA), deleted on lawful request thereafter |
@@ -33,7 +33,8 @@ This is a template privacy policy. Customize the highlighted sections (`<<...>>`
 
 ## 4. Who we share with
 
-- **Payment processors** — Stripe, RevenueCat, Google Play, Apple.
+- **Payment processors** — Google Play Billing only. (No Stripe, RevenueCat,
+  or Apple billing is integrated in this app.)
 - **Cloud / hosting** — AWS, Vercel, Supabase, Appwrite, Convex, Cloudflare.
 - **Communication** — Resend, Twilio (where applicable).
 - **AI / ML** — Google Gemini, OpenAI (only where the user opts in and only with redacted inputs).
