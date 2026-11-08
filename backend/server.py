@@ -1,7 +1,8 @@
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request, Depends
+from fastapi.security import HTTPBearer
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -16,11 +17,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import httpx
 import zipfile
 import io
 import json
+import secrets
+import jwt as pyjwt
 import aiofiles
 import tempfile
 import asyncio
@@ -53,6 +56,54 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # Google Play Billing config
 PLAY_PACKAGE_NAME = os.environ.get('GOOGLE_PLAY_PACKAGE_NAME', 'com.poordudeholdings.appstack')
 PLAY_SERVICE_ACCOUNT_FILE = os.environ.get('GOOGLE_PLAY_SERVICE_ACCOUNT_FILE')
+
+# --- Authentication: server-issued session tokens ---------------------------
+# POST /api/auth/google verifies a Google ID token and issues a short-lived
+# JWT session token. Every other user/project/billing route requires that
+# token (Authorization: Bearer <token>) and only ever acts on the user the
+# token identifies — client-supplied userId/email values are never trusted.
+# SESSION_SECRET must be set to a long random value in production; if it is
+# unset we generate an ephemeral one so local dev still works, but sessions
+# then do not survive a restart (a warning is logged).
+SESSION_SECRET = os.environ.get('SESSION_SECRET')
+if not SESSION_SECRET:
+    SESSION_SECRET = secrets.token_urlsafe(32)
+    logger_warning = logging.getLogger(__name__)
+    logger_warning.warning(
+        "SESSION_SECRET not set — using an ephemeral secret; "
+        "sessions will not survive a restart. Set SESSION_SECRET in production."
+    )
+SESSION_TTL = timedelta(days=7)
+
+# --- Upload limits -----------------------------------------------------------
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded ZIP
+MAX_UPLOAD_UNCOMPRESSED_BYTES = 100 * 1024 * 1024  # 100 MB total when unzipped
+ALLOWED_UPLOAD_CONTENT_TYPES = {
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+}
+
+
+def _cors_origins() -> list:
+    """Safe CORS default: never '*' with credentials.
+
+    Unset CORS_ORIGINS -> local dev frontend only. An explicit '*' is
+    dropped (with a warning) because Starlette refuses/ignores '*' together
+    with allow_credentials=True and it would expose authenticated APIs to
+    any origin. Deploy-time: set CORS_ORIGINS to the exact frontend origin(s).
+    """
+    raw = os.environ.get('CORS_ORIGINS', '')
+    if not raw.strip():
+        return ["http://localhost:3000"]
+    origins = [o.strip() for o in raw.split(',') if o.strip()]
+    if '*' in origins:
+        logging.getLogger(__name__).warning(
+            "CORS_ORIGINS contains '*' with credentials — '*' dropped; "
+            "set explicit origins instead."
+        )
+        origins = [o for o in origins if o != '*'] or ["http://localhost:3000"]
+    return origins
 # Map Play Store subscription product IDs -> internal tier names
 PLAY_PRODUCT_TIERS = {
     "pro": "pro",
@@ -205,6 +256,9 @@ class User(BaseModel):
     email: str
     name: Optional[str] = None
     subscription: str = "free"  # free, pro, team
+    # Legacy field — no Stripe integration exists in this codebase
+    # (billing is Google Play only); kept only so stored user documents
+    # still validate. Do not treat it as evidence of a Stripe customer.
     stripeCustomerId: Optional[str] = None
     subscriptionId: Optional[str] = None
     subscriptionStatus: str = "active"  # active, canceled, past_due
@@ -215,6 +269,56 @@ class User(BaseModel):
 class UserCreate(BaseModel):
     email: str
     name: Optional[str] = None
+
+
+# --- Authentication helpers -------------------------------------------------
+def create_session_token(user: dict) -> str:
+    """Issue a signed JWT session token for an already-verified user."""
+    now = datetime.now(timezone.utc)
+    return pyjwt.encode(
+        {"sub": user["id"], "email": user.get("email"), "iat": now, "exp": now + SESSION_TTL},
+        SESSION_SECRET,
+        algorithm="HS256",
+    )
+
+
+async def get_current_user(request: Request) -> dict:
+    """Dependency: resolve the caller from a Bearer session token.
+
+    The token is issued only by POST /api/auth/google after Google verifies
+    the ID token. A missing, malformed, expired, or forged token is 401;
+    a token whose user no longer exists is also 401. Nothing in the request
+    body/query can substitute for this check.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = auth[len("Bearer "):].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    try:
+        payload = pyjwt.decode(
+            token, SESSION_SECRET, algorithms=["HS256"],
+            options={"require": ["sub", "exp"]},
+        )
+    except pyjwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="Session user not found")
+    return user
+
+
+async def require_project_owner(project_id: str, current_user: dict) -> dict:
+    """Load a project and enforce ownership. 404 if missing, 403 if another
+    user's. Returns the project document."""
+    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.get("userId") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You do not own this project")
+    return project
+
 
 class PlayVerifyRequest(BaseModel):
     userId: str
@@ -348,6 +452,12 @@ def parse_uploaded_zip(file_content: bytes) -> dict:
     
     try:
         with zipfile.ZipFile(io.BytesIO(file_content)) as zf:
+            # Zip-bomb guard: refuse archives whose uncompressed total
+            # exceeds MAX_UPLOAD_UNCOMPRESSED_BYTES.
+            total_uncompressed = sum(info.file_size for info in zf.infolist())
+            if total_uncompressed > MAX_UPLOAD_UNCOMPRESSED_BYTES:
+                logger.error("Uploaded ZIP exceeds uncompressed size limit")
+                return {}
             for name in zf.namelist():
                 basename = os.path.basename(name)
                 if basename in key_files or any(kf in name for kf in key_files):
@@ -520,50 +630,35 @@ async def root():
     return {"message": "Deployment & Docs Copilot API"}
 
 # --- User & Subscription Routes ---
+# SECURITY: the old email-only POST /api/users (log in as anyone by email)
+# and the unauthenticated GET /api/users/email/{email} were removed.
+# The only way to obtain an account/session is POST /api/auth/google,
+# which verifies a Google ID token server-side and issues a session token.
 @api_router.get("/tiers")
 async def get_tiers():
     """Get all subscription tiers"""
     return SUBSCRIPTION_TIERS
 
-@api_router.post("/users", response_model=User)
-async def create_or_get_user(user_data: UserCreate):
-    """Create or get existing user"""
-    existing = await db.users.find_one({"email": user_data.email}, {"_id": 0})
-    if existing:
-        return existing
-    
-    user = User(email=user_data.email, name=user_data.name)
-    doc = user.model_dump()
-    doc['createdAt'] = doc['createdAt'].isoformat()
-    doc['updatedAt'] = doc['updatedAt'].isoformat()
-    await db.users.insert_one(doc)
-    return user
 
-@api_router.get("/users/{user_id}")
-async def get_user(user_id: str):
-    """Get user by ID"""
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Get project count
-    project_count = await db.projects.count_documents({"userId": user_id})
-    user["projectCount"] = project_count
-    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
-    
-    return user
-
-@api_router.get("/users/email/{email}")
-async def get_user_by_email(email: str):
-    """Get user by email"""
-    user = await db.users.find_one({"email": email}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
+@api_router.get("/users/me")
+async def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+    """Get the authenticated caller's own profile."""
+    user = dict(current_user)
     project_count = await db.projects.count_documents({"userId": user["id"]})
     user["projectCount"] = project_count
     user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
-    
+    return user
+
+
+@api_router.get("/users/{user_id}")
+async def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Get a user by ID — only your own record."""
+    if user_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only view your own profile")
+    user = dict(current_user)
+    project_count = await db.projects.count_documents({"userId": user_id})
+    user["projectCount"] = project_count
+    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
     return user
 
 # --- Google OAuth Route ---
@@ -596,6 +691,7 @@ async def auth_with_google(request: Request):
         project_count = await db.projects.count_documents({"userId": existing["id"]})
         existing["projectCount"] = project_count
         existing["tierLimits"] = SUBSCRIPTION_TIERS.get(existing.get("subscription", "free"))
+        existing["sessionToken"] = create_session_token(existing)
         return existing
 
     user = User(email=email, name=name)
@@ -607,6 +703,7 @@ async def auth_with_google(request: Request):
     user_dict = user.model_dump()
     user_dict["projectCount"] = 0
     user_dict["tierLimits"] = SUBSCRIPTION_TIERS["free"]
+    user_dict["sessionToken"] = create_session_token(user_dict)
     return user_dict
 
 # --- Google Play Billing ---
@@ -643,8 +740,10 @@ async def _play_publisher():
 
 
 @api_router.post("/billing/verify")
-async def verify_play_purchase(request: PlayVerifyRequest):
+async def verify_play_purchase(request: PlayVerifyRequest, current_user: dict = Depends(get_current_user)):
     """Verify a Google Play subscription purchase token and grant the matching tier."""
+    if request.userId != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only verify purchases for your own account")
     if not PLAY_SERVICE_ACCOUNT_FILE:
         raise HTTPException(status_code=500, detail="Play billing not configured on this server")
 
@@ -704,7 +803,7 @@ async def verify_play_purchase(request: PlayVerifyRequest):
 
 
 @api_router.get("/checkout/status/{session_id}")
-async def get_checkout_status(session_id: str):
+async def get_checkout_status(session_id: str, current_user: dict = Depends(get_current_user)):
     """Return the status of a checkout session.
 
     The frontend's PaymentSuccessPage polls this endpoint after the user
@@ -712,10 +811,12 @@ async def get_checkout_status(session_id: str):
     so the frontend always rendered 'Payment Failed'.
 
     Resolution: look up the payment_transactions row that the Play verify
-    endpoint (and any future Stripe webhook) writes by sessionId.
+    endpoint writes by sessionId.
+    Only the transaction owner's sessions are visible; anyone else's
+    sessionId returns the same pending response as a missing one.
     """
     tx = await db.payment_transactions.find_one(
-        {"sessionId": session_id}, {"_id": 0}
+        {"sessionId": session_id, "userId": current_user["id"]}, {"_id": 0}
     )
     if not tx:
         # No record yet — frontend should keep polling for a bounded number of
@@ -734,12 +835,17 @@ async def get_checkout_status(session_id: str):
 
 # --- Project Routes ---
 @api_router.get("/projects", response_model=List[Project])
-async def get_projects(userId: Optional[str] = None):
-    """Get all projects, optionally filtered by user"""
-    query = {}
-    if userId:
-        query["userId"] = userId
-    
+async def get_projects(userId: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    """Get the authenticated user's own projects.
+
+    A client-supplied userId that is not the caller's own is rejected (403);
+    without one, the list is always scoped to the caller — the old behaviour
+    of returning everyone's projects when no userId was given is gone.
+    """
+    if userId is not None and userId != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only list your own projects")
+    query = {"userId": current_user["id"]}
+
     projects = await db.projects.find(query, {"_id": 0}).sort("createdAt", -1).to_list(100)
     for p in projects:
         if isinstance(p.get('createdAt'), str):
@@ -749,15 +855,15 @@ async def get_projects(userId: Optional[str] = None):
     return projects
 
 @api_router.get("/projects/{project_id}")
-async def get_project(project_id: str):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
+async def get_project(project_id: str, current_user: dict = Depends(get_current_user)):
+    return await require_project_owner(project_id, current_user)
 
 @api_router.post("/projects", response_model=Project)
-async def create_project(project_data: ProjectCreate):
-    user_id = project_data.userId
+async def create_project(project_data: ProjectCreate, current_user: dict = Depends(get_current_user)):
+    # Ownership is taken from the session token, never from the request body:
+    # a client-supplied userId is ignored so one user cannot create projects
+    # (or spend another user's quota/limits) under someone else's id.
+    user_id = current_user["id"]
     
     # Check project limit
     if user_id and not await check_project_limit(user_id):
@@ -789,8 +895,21 @@ async def create_project(project_data: ProjectCreate):
     return project
 
 @api_router.post("/projects/{project_id}/upload")
-async def upload_file(project_id: str, file: UploadFile = File(...)):
-    content = await file.read()
+async def upload_file(project_id: str, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    # Owner only, and only ZIP files up to MAX_UPLOAD_BYTES. The previous
+    # endpoint had no auth and no size limit, so anyone could overwrite any
+    # project's uploadRef with an arbitrarily large file.
+    await require_project_owner(project_id, current_user)
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    if file.content_type and file.content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds the 10 MB limit")
+    if not content.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+        raise HTTPException(status_code=400, detail="File is not a valid ZIP archive")
     file_id = str(uuid.uuid4())
     temp_dir = Path(tempfile.gettempdir()) / "copilot_uploads"
     temp_dir.mkdir(exist_ok=True)
@@ -808,10 +927,8 @@ async def upload_file(project_id: str, file: UploadFile = File(...)):
 
 @api_router.post("/projects/{project_id}/analyze")
 @limiter.limit("10/minute")
-async def analyze_project(request: Request, project_id: str, reanalyze: bool = False):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def analyze_project(request: Request, project_id: str, reanalyze: bool = False, current_user: dict = Depends(get_current_user)):
+    project = await require_project_owner(project_id, current_user)
     
     user_id = project.get("userId")
     
@@ -821,8 +938,8 @@ async def analyze_project(request: Request, project_id: str, reanalyze: bool = F
 
     # Per-user daily Gemini quota (tier-aware).
     if user_id:
-        user = await db.users.find_one({"id": user_id}, {"_id": 0, "tier": 1})
-        tier = (user or {}).get("tier", "free")
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
+        tier = (user or {}).get("subscription", "free")
         allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
         if not allowed:
             raise HTTPException(
@@ -863,13 +980,23 @@ async def analyze_project(request: Request, project_id: str, reanalyze: bool = F
 
 @api_router.post("/projects/{project_id}/generate")
 @limiter.limit("10/minute")
-async def generate_content(http_request: Request, project_id: str, request: GenerateRequest):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def generate_content(http_request: Request, project_id: str, request: GenerateRequest, current_user: dict = Depends(get_current_user)):
+    project = await require_project_owner(project_id, current_user)
     
     if project["status"] == "pending":
         raise HTTPException(status_code=400, detail="Project must be analyzed first")
+    
+    # Per-user daily Gemini quota (tier-aware) — same accounting as /analyze.
+    user_id = project.get("userId")
+    if user_id:
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
+        tier = (user or {}).get("subscription", "free")
+        allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily AI quota exceeded ({used}/{quota}). Resets at 00:00 UTC.",
+            )
     
     result = await generate_plans_and_docs(project, request.generateType, project.get("aiProvider", "gemini"))
     
@@ -892,23 +1019,19 @@ async def generate_content(http_request: Request, project_id: str, request: Gene
     return {**project, **update_data}
 
 @api_router.get("/projects/{project_id}/can-export")
-async def check_can_export(project_id: str):
+async def check_can_export(project_id: str, current_user: dict = Depends(get_current_user)):
     """Check if user can export this project"""
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
+    project = await require_project_owner(project_id, current_user)
+
     user_id = project.get("userId")
     can_export = await check_export_access(user_id) if user_id else False
     
     return {"canExport": can_export}
 
 @api_router.delete("/projects/{project_id}")
-async def delete_project(project_id: str):
-    project = await db.projects.find_one({"id": project_id}, {"_id": 0})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
+async def delete_project(project_id: str, current_user: dict = Depends(get_current_user)):
+    project = await require_project_owner(project_id, current_user)
+
     result = await db.projects.delete_one({"id": project_id})
     
     # Update user project count
@@ -924,7 +1047,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )

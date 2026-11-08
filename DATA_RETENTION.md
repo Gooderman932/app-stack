@@ -11,7 +11,7 @@
 | Active user accounts | While active | N/A |
 | Inactive user accounts | 2 years from last login | Anonymize PII, retain aggregate stats |
 | Audit logs | 7 years | Hard-delete |
-| Payment records (Stripe/RevenueCat) | 7 years (IRS) | Hard-delete |
+| Payment records (Google Play Billing) | 7 years (IRS) | Hard-delete |
 | PHI (if applicable, HIPAA) | 6 years minimum from last service date | Hard-delete on lawful request |
 | Application content (estimates, plans, listings) | 2 years inactivity | Anonymize then delete |
 | Telemetry / request logs | 90 days | Hard-delete |
