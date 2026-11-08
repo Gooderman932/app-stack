@@ -34,6 +34,28 @@ import {
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// Session token issued by POST /auth/google. Sent as a bearer token on every
+// API call; the server checks it on all user-specific routes.
+const SESSION_KEY = "sessionToken";
+const readSession = () => {
+  try { return localStorage.getItem(SESSION_KEY); } catch { return null; }
+};
+const writeSession = (token) => {
+  try {
+    if (token) localStorage.setItem(SESSION_KEY, token);
+    else localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem("userEmail"); // legacy email-only sign-in
+  } catch { /* storage unavailable: session lasts for this page only */ }
+};
+axios.interceptors.request.use((config) => {
+  const token = readSession();
+  if (token && config.url && config.url.startsWith(API)) {
+    config.headers = config.headers || {};
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
 // True when running inside the native Android (Capacitor) app rather than a browser.
 const IS_NATIVE = Capacitor.isNativePlatform();
 
@@ -55,62 +77,56 @@ const UserProvider = ({ children }) => {
   const [loading, setLoading] = useState(true);
   
   useEffect(() => {
-    const savedEmail = localStorage.getItem("userEmail");
-    if (savedEmail) {
-      fetchUser(savedEmail);
+    if (readSession()) {
+      fetchUser();
     } else {
+      writeSession(null);
       setLoading(false);
     }
   }, []);
   
-  const fetchUser = async (email) => {
+  const fetchUser = async () => {
     try {
-      const res = await axios.get(`${API}/users/email/${email}`);
+      const res = await axios.get(`${API}/auth/me`);
       setUser(res.data);
     } catch (e) {
-      localStorage.removeItem("userEmail");
+      // Expired or revoked session: sign out locally.
+      if (e?.response?.status === 401) {
+        writeSession(null);
+        setUser(null);
+      }
     } finally {
       setLoading(false);
-    }
-  };
-  
-  const login = async (email, name) => {
-    try {
-      const res = await axios.post(`${API}/users`, { email, name });
-      setUser(res.data);
-      localStorage.setItem("userEmail", email);
-      return res.data;
-    } catch (e) {
-      toast.error("Failed to login");
-      return null;
     }
   };
 
   const loginWithGoogle = async (credential) => {
     try {
       const res = await axios.post(`${API}/auth/google`, { credential });
-      setUser(res.data);
-      localStorage.setItem("userEmail", res.data.email);
-      return res.data;
+      const { sessionToken, ...profile } = res.data;
+      writeSession(sessionToken);
+      setUser(profile);
+      return profile;
     } catch (e) {
       toast.error("Google login failed");
       return null;
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    try { await axios.post(`${API}/auth/logout`); } catch { /* already signed out */ }
+    writeSession(null);
     setUser(null);
-    localStorage.removeItem("userEmail");
   };
   
   const refreshUser = async () => {
-    if (user?.email) {
-      await fetchUser(user.email);
+    if (readSession()) {
+      await fetchUser();
     }
   };
   
   return (
-    <UserContext.Provider value={{ user, loading, login, loginWithGoogle, logout, refreshUser }}>
+    <UserContext.Provider value={{ user, loading, loginWithGoogle, logout, refreshUser }}>
       {children}
     </UserContext.Provider>
   );
@@ -181,9 +197,7 @@ const Header = () => {
 
 // Login Dialog
 const LoginDialog = ({ open, onOpenChange }) => {
-  const { login, loginWithGoogle } = useUser();
-  const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const { loginWithGoogle } = useUser();
   const [loading, setLoading] = useState(false);
   const googleButtonRef = useRef(null);
   const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
@@ -261,18 +275,6 @@ const LoginDialog = ({ open, onOpenChange }) => {
     }
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!email) return;
-    setLoading(true);
-    const result = await login(email, name);
-    setLoading(false);
-    if (result) {
-      toast.success("Welcome!");
-      onOpenChange(false);
-    }
-  };
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
@@ -282,42 +284,17 @@ const LoginDialog = ({ open, onOpenChange }) => {
         </DialogHeader>
 
         {IS_NATIVE ? (
-          <>
-            <Button variant="outline" className="w-full" onClick={handleNativeGoogle} disabled={loading} data-testid="google-signin-native">
-              {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              Continue with Google
-            </Button>
-            <div className="relative flex items-center gap-3">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground">or continue with email</span>
-              <Separator className="flex-1" />
-            </div>
-          </>
-        ) : GOOGLE_CLIENT_ID ? (
-          <>
-            <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
-            <div className="relative flex items-center gap-3">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground">or continue with email</span>
-              <Separator className="flex-1" />
-            </div>
-          </>
-        ) : null}
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <Label>Email *</Label>
-            <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" data-testid="login-email" />
-          </div>
-          <div className="space-y-2">
-            <Label>Name (optional)</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" data-testid="login-name" />
-          </div>
-          <Button type="submit" className="w-full" disabled={loading || !email} data-testid="login-submit">
+          <Button variant="outline" className="w-full" onClick={handleNativeGoogle} disabled={loading} data-testid="google-signin-native">
             {loading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-            Continue
+            Continue with Google
           </Button>
-        </form>
+        ) : GOOGLE_CLIENT_ID ? (
+          <div ref={googleButtonRef} className="flex justify-center w-full" data-testid="google-signin-btn" />
+        ) : (
+          <p className="text-sm text-muted-foreground" data-testid="signin-unavailable">
+            Sign-in is not set up on this site yet. Set REACT_APP_GOOGLE_CLIENT_ID to enable Google sign-in.
+          </p>
+        )}
       </DialogContent>
     </Dialog>
   );
@@ -693,8 +670,11 @@ const HomePage = () => {
   
   const fetchProjects = async () => {
     try {
-      const url = user ? `${API}/projects?userId=${user.id}` : `${API}/projects`;
-      const res = await axios.get(url);
+      if (!user) {
+        setProjects([]);
+        return;
+      }
+      const res = await axios.get(`${API}/projects`);
       setProjects(res.data);
     } catch (e) {
       toast.error("Failed to load projects");
@@ -872,11 +852,13 @@ const InputProjectPage = () => {
     if (formData.sourceType === "upload" && !uploadedFile) { toast.error("Upload a ZIP file"); return; }
     if (formData.sourceType === "text_only" && !formData.textDescription.trim()) { toast.error("Project description required for text-only mode"); return; }
     
+    if (!user) { toast.error("Sign in to create a project"); return; }
+    
     setLoading(true);
     setProgress(10);
     
     try {
-      const projectRes = await axios.post(`${API}/projects`, { ...formData, userId: user?.id });
+      const projectRes = await axios.post(`${API}/projects`, formData);
       const projectId = projectRes.data.id;
       setProgress(30);
       

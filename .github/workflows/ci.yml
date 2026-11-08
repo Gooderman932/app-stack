@@ -38,6 +38,7 @@ jobs:
         working-directory: backend
         run: |
           if compgen -G "test_*.py" > /dev/null || compgen -G "tests/*.py" > /dev/null; then
+            pip install 'mongomock-motor<0.0.30'
             pytest -q
           else
             echo "no tests yet — skipping"
