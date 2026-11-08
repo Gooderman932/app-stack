@@ -51,8 +51,13 @@ MongoDB (projects collection)
 
 - **Feb 4, 2026**: Monetization Complete
   - 3-tier subscription: Free ($0), Pro ($12/mo), Team ($29/mo)
-  - Stripe checkout integration with payment success polling
-  - User authentication via email (stored in localStorage)
+  - Google Play Billing subscription verification with payment success polling
+    (POST /api/billing/verify). There is NO Stripe checkout in this codebase:
+    the Stripe checkout/webhook endpoints in earlier versions of this table
+    never existed in backend/server.py, and no Stripe keys are configured.
+  - User authentication via Google OAuth (POST /api/auth/google verifies the
+    Google ID token and issues a session token). The old email-only
+    POST /api/users login was removed: it let anyone log in as any user.
   - Feature gating:
     - Free: 3 projects, Gemini only, no ZIP export, 1 re-analysis
     - Pro: Unlimited projects, all AI providers, ZIP export, unlimited re-analysis
@@ -77,20 +82,24 @@ Project {
 ## API Endpoints
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | /api/projects | List all projects |
-| GET | /api/projects/:id | Get single project |
-| POST | /api/projects | Create new project |
-| POST | /api/projects/:id/upload | Upload ZIP file |
-| POST | /api/projects/:id/analyze | Run AI analysis |
-| POST | /api/projects/:id/generate | Generate plans/docs |
-| DELETE | /api/projects/:id | Delete project |
+| GET | /api/projects | List the authenticated user's own projects (owner-scoped) |
+| GET | /api/projects/:id | Get single project (owner only) |
+| POST | /api/projects | Create new project (owner taken from session token) |
+| POST | /api/projects/:id/upload | Upload ZIP file (owner only, .zip only, 10 MB max) |
+| POST | /api/projects/:id/analyze | Run AI analysis (owner only) |
+| POST | /api/projects/:id/generate | Generate plans/docs (owner only) |
+| DELETE | /api/projects/:id | Delete project (owner only) |
 | GET | /api/tiers | Get subscription tiers |
-| POST | /api/users | Create/get user |
-| GET | /api/users/:id | Get user by ID |
-| GET | /api/users/email/:email | Get user by email |
-| POST | /api/checkout/create | Start Stripe checkout |
-| GET | /api/checkout/status/:session_id | Check payment status |
-| POST | /api/webhook/stripe | Stripe webhook |
+| POST | /api/auth/google | Verify Google ID token, return user + session token |
+| GET | /api/users/me | Get the authenticated user's profile |
+| GET | /api/users/:id | Get user by ID (own record only) |
+| POST | /api/billing/verify | Verify a Google Play subscription purchase token |
+| GET | /api/checkout/status/:session_id | Check payment status (own transactions only) |
+
+> Removed: POST /api/users (email-only login — critical auth hole) and
+> GET /api/users/email/:email (unauthenticated lookup). Never existed in
+> code despite earlier drafts of this table: POST /api/checkout/create
+> (Stripe) and POST /api/webhook/stripe. Billing is Google Play only.
 
 ## Prioritized Backlog
 
