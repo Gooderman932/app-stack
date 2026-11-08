@@ -1,3 +1,7 @@
+# NOTE (Nov 2026 auth fix): this live-server script predates authentication.
+# It calls project routes unauthenticated, so it WILL FAIL against the
+# current server (401). Use tests/test_auth.py (pytest, no live services
+# needed) instead; do not "fix" this script by removing the auth checks.
 import requests
 import sys
 import json
