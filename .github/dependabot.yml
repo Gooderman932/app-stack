@@ -49,6 +49,13 @@ updates:
       capacitor:
         patterns:
           - "@capacitor/*"
+    ignore:
+      # The frontend is Create React App (react-scripts 5) with a Tailwind 3
+      # JS config. Tailwind 4 needs the @tailwindcss/postcss plugin and a
+      # CSS-first config; a lone Dependabot bump to 4.x broke the build.
+      # Upgrade Tailwind together with the move off CRA (e.g. to Vite).
+      - dependency-name: "tailwindcss"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "docker"
     directory: "/backend"

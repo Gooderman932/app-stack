@@ -51,12 +51,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          # Node 20 is end of life; Capacitor 8's CLI requires Node 22+.
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
       - name: Install deps
         working-directory: frontend
-        run: npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+        # npm ci only: falling back to npm install hid an out-of-sync lockfile.
+        run: npm ci --legacy-peer-deps
       - name: Patch ajv (CRA/react-scripts compatibility)
         working-directory: frontend
         run: npm install --no-save --legacy-peer-deps ajv@^8 ajv-keywords@^5 || true
@@ -64,7 +66,10 @@ jobs:
         working-directory: frontend
         env:
           CI: 'false'  # treat warnings as warnings, not errors
-        run: npm run build || (echo "::warning::CRA build failed — likely pre-existing repo issue, not blocking audit PR" && exit 0)
+        # Blocking: a Dependabot-merged Tailwind 4 bump and lucide-react 1.x
+        # (which dropped the Github icon) broke this build unnoticed while it
+        # was allowed to fail.
+        run: npm run build
 
   secret-scan:
     name: Secret scan
