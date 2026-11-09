@@ -3,8 +3,7 @@
 Runs against the real FastAPI app with an in-memory fake MongoDB, so it
 needs NO MongoDB, NO Gemini key and NO Google credentials:
 
-    MONGO_URL=mongodb://localhost:27017 DB_NAME=test SESSION_SECRET=test-secret \
-        python -m pytest tests/test_auth.py -v
+    cd backend && python -m pytest tests/test_auth.py -v
 
 What is verified here:
   * email-only POST /api/users is gone (404) — it let anyone log in as anyone
@@ -14,6 +13,8 @@ What is verified here:
   * POST /api/projects ignores a spoofed userId in the body
   * upload requires ownership and enforces .zip-only + 10 MB limit
   * CORS never defaults to '*' with credentials
+  * Google sign-in rejects invalid tokens and unverified emails
+  * POST /api/auth/logout revokes every token issued before it
 
 What is NOT verified here (needs live services — see launch-ready doc):
   * POST /api/auth/google with a real Google ID token
@@ -31,8 +32,9 @@ import pytest
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 os.environ.setdefault("DB_NAME", "test")
 os.environ.setdefault("SESSION_SECRET", "test-secret-for-local-tests-only")
+os.environ.setdefault("GOOGLE_CLIENT_ID", "test-client")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -333,3 +335,68 @@ def test_parse_uploaded_zip_rejects_zip_bomb():
         info.file_size = server.MAX_UPLOAD_UNCOMPRESSED_BYTES + 1
         zf.writestr(info, b"x" * 10)
     assert server.parse_uploaded_zip(buf.getvalue()) == {}
+
+
+# --- Google sign-in -------------------------------------------------------
+def _fake_google(monkeypatch, verified=True):
+    def verify(credential, _request, _client_id):
+        if credential == "bad":
+            raise ValueError("bad token")
+        return {"email": credential, "email_verified": verified, "name": "Test"}
+
+    monkeypatch.setattr(server.id_token, "verify_oauth2_token", verify)
+
+
+def test_google_sign_in_rejects_an_invalid_token(seeded, monkeypatch):
+    client, *_ = seeded
+    _fake_google(monkeypatch)
+    assert client.post("/api/auth/google", json={"credential": "bad"}).status_code == 401
+
+
+def test_google_sign_in_rejects_an_unverified_email(seeded, monkeypatch):
+    client, db, *_ = seeded
+    _fake_google(monkeypatch, verified=False)
+    r = client.post("/api/auth/google", json={"credential": "alice@example.com"})
+    assert r.status_code == 401, r.text
+    assert "sessionToken" not in r.text
+
+
+def test_google_sign_in_issues_a_working_session(seeded, monkeypatch):
+    client, *_ = seeded
+    _fake_google(monkeypatch)
+    r = client.post("/api/auth/google", json={"credential": "carol@example.com"})
+    assert r.status_code == 200, r.text
+    headers = {"Authorization": f"Bearer {r.json()['sessionToken']}"}
+    me = client.get("/api/users/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json()["email"] == "carol@example.com"
+
+
+# --- Sign-out ---------------------------------------------------------------
+def test_logout_requires_a_session(seeded):
+    client, *_ = seeded
+    assert client.post("/api/auth/logout").status_code == 401
+
+
+def test_logout_revokes_existing_tokens(seeded, monkeypatch):
+    client, db, alice, _bob = seeded
+    old = _auth(alice)
+    assert client.get("/api/users/me", headers=old).status_code == 200
+
+    assert client.post("/api/auth/logout", headers=old).status_code == 200
+    assert client.get("/api/users/me", headers=old).status_code == 401
+
+    # Signing in again issues a token for the new session version.
+    _fake_google(monkeypatch)
+    r = client.post("/api/auth/google", json={"credential": "alice@example.com"})
+    assert r.status_code == 200, r.text
+    fresh = {"Authorization": f"Bearer {r.json()['sessionToken']}"}
+    assert client.get("/api/users/me", headers=fresh).status_code == 200
+    assert client.get("/api/users/me", headers=old).status_code == 401
+
+
+def test_logout_only_affects_the_caller(seeded):
+    client, _db, alice, bob = seeded
+    bob_headers = _auth(bob)
+    assert client.post("/api/auth/logout", headers=_auth(alice)).status_code == 200
+    assert client.get("/api/users/me", headers=bob_headers).status_code == 200

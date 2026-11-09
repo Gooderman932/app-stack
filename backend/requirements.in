@@ -1,0 +1,33 @@
+# Runtime dependencies imported by server.py and rate_limit.py.
+#
+# requirements.txt (runtime) and requirements-dev.txt (CI) are pinned,
+# hash-checked lockfiles compiled from the .in files. Do not edit them by
+# hand: change an .in file, then regenerate both for Python 3.14 (the version
+# backend/Dockerfile ships):
+#
+#   uv pip compile --python-version 3.14 --generate-hashes requirements.in -o requirements.txt
+#   uv pip compile --python-version 3.14 --generate-hashes requirements-dev.in -o requirements-dev.txt
+#
+# Dependabot updates the .in and .txt files together, so pins can no longer
+# drift into impossible combinations (main had pydantic 2.13.4 pinned next to
+# pydantic-core 2.47.0, which no pydantic release accepts).
+
+aiofiles>=25.1
+fastapi>=0.138,<1
+google-api-python-client>=2.187,<3
+google-auth>=2.47,<3
+# 3.x switches the default Gemini API version to v1 and the HTTP client to
+# httpx2; adopt it deliberately, not through a routine bump.
+google-genai>=2.10,<3
+httpx>=0.28,<1
+# Motor is deprecated in favour of PyMongo's native async API
+# (pymongo.AsyncMongoClient); plan that migration before Motor 4.
+motor>=3.3,<4
+pydantic>=2.13,<3
+PyJWT>=2.10,<3
+python-dotenv>=1.2,<2
+python-multipart>=0.0.21
+requests>=2.32,<3
+slowapi>=0.1.9,<0.2
+starlette
+uvicorn>=0.49,<1
