@@ -35,7 +35,12 @@ if (config.enableHealthCheck) {
 const webpackConfig = {
   eslint: {
     configure: {
-      extends: ["plugin:react-hooks/recommended"],
+      // eslint-plugin-react-hooks 7's "recommended" preset adds the React
+      // Compiler rules (set-state-in-effect, immutability, ...) as errors,
+      // and CRA fails the build on lint errors. Keep the two classic hook
+      // rules here; adopt the compiler rules once App.js's effects are
+      // refactored for them.
+      plugins: ["react-hooks"],
       rules: {
         "react-hooks/rules-of-hooks": "error",
         "react-hooks/exhaustive-deps": "warn",
