@@ -104,7 +104,14 @@ const UserProvider = ({ children }) => {
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    // Revoke the session server-side first (invalidates every token issued
+    // so far), then forget it locally even if the network call fails.
+    try {
+      if (getSessionToken()) await axios.post(`${API}/auth/logout`);
+    } catch (e) {
+      // Offline or already expired: clearing the local token below still signs out.
+    }
     setUser(null);
     localStorage.removeItem("sessionToken");
     applyAuthHeader();

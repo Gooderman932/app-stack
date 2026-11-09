@@ -1,0 +1,11 @@
+# CI / local development: the runtime set plus lint and test tools.
+# Constrained to requirements.txt so shared packages match production exactly.
+-c requirements.txt
+-r requirements.in
+
+black
+flake8
+isort
+mongomock-motor<0.0.30
+mypy
+pytest

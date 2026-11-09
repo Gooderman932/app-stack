@@ -276,7 +276,15 @@ def create_session_token(user: dict) -> str:
     """Issue a signed JWT session token for an already-verified user."""
     now = datetime.now(timezone.utc)
     return pyjwt.encode(
-        {"sub": user["id"], "email": user.get("email"), "iat": now, "exp": now + SESSION_TTL},
+        {
+            "sub": user["id"],
+            "email": user.get("email"),
+            # Session version: POST /api/auth/logout bumps the user's
+            # sessionVersion, which invalidates every token issued before it.
+            "ver": user.get("sessionVersion", 0),
+            "iat": now,
+            "exp": now + SESSION_TTL,
+        },
         SESSION_SECRET,
         algorithm="HS256",
     )
@@ -306,6 +314,8 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Session user not found")
+    if payload.get("ver", 0) != user.get("sessionVersion", 0):
+        raise HTTPException(status_code=401, detail="Session has been signed out")
     return user
 
 
@@ -640,6 +650,13 @@ async def get_tiers():
     return SUBSCRIPTION_TIERS
 
 
+@api_router.post("/auth/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    """Sign out everywhere: every session token issued before now stops working."""
+    await db.users.update_one({"id": current_user["id"]}, {"$inc": {"sessionVersion": 1}})
+    return {"ok": True}
+
+
 @api_router.get("/users/me")
 async def get_current_user_profile(current_user: dict = Depends(get_current_user)):
     """Get the authenticated caller's own profile."""
@@ -682,6 +699,11 @@ async def auth_with_google(request: Request):
         )
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+
+    # Only a Google-verified email may own an account: an unverified address
+    # could belong to someone else, and accounts are keyed by email.
+    if not idinfo.get("email") or idinfo.get("email_verified") is not True:
+        raise HTTPException(status_code=401, detail="Google account email is not verified")
 
     email = idinfo["email"]
     name = idinfo.get("name", email.split("@")[0])
