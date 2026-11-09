@@ -26,7 +26,7 @@ import { GoogleAuth } from "@codetrix-studio/capacitor-google-auth";
 import "cordova-plugin-purchase"; // exposes window.CdvPurchase (Google Play Billing)
 import {
   Rocket, FileCode, Server, Cloud, Box, Sun, Moon, Plus, ArrowLeft,
-  Github, Upload, FileText, Loader2, Check, Copy, Download, FolderTree,
+  FolderGit2, Upload, FileText, Loader2, Check, Copy, Download, FolderTree,
   Database, Cpu, Globe, Settings, ChevronRight, Trash2, RefreshCw,
   Crown, Zap, Users, CreditCard, Star, Lock, X
 } from "lucide-react";
@@ -773,7 +773,7 @@ const HomePage = () => {
                 <CardContent className="flex items-center justify-between p-4">
                   <div className="flex items-center gap-4">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-secondary">
-                      {project.sourceType === "github_url" ? <Github className="h-5 w-5" /> : 
+                      {project.sourceType === "github_url" ? <FolderGit2 className="h-5 w-5" /> : 
                        project.sourceType === "upload" ? <Upload className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
                     </div>
                     <div>
@@ -901,7 +901,7 @@ const InputProjectPage = () => {
             <Label>Source Type</Label>
             <Tabs value={formData.sourceType} onValueChange={(v) => setFormData({ ...formData, sourceType: v })}>
               <TabsList className="grid w-full grid-cols-3">
-                <TabsTrigger value="github_url" className="gap-2" data-testid="tab-github"><Github className="h-4 w-4" />GitHub URL</TabsTrigger>
+                <TabsTrigger value="github_url" className="gap-2" data-testid="tab-github"><FolderGit2 className="h-4 w-4" />GitHub URL</TabsTrigger>
                 <TabsTrigger value="upload" className="gap-2" data-testid="tab-upload"><Upload className="h-4 w-4" />Upload ZIP</TabsTrigger>
                 <TabsTrigger value="text_only" className="gap-2" data-testid="tab-text"><FileText className="h-4 w-4" />Text Only</TabsTrigger>
               </TabsList>
@@ -1080,7 +1080,7 @@ const ProjectDetailPage = () => {
           <div>
             <h1 className="text-2xl font-bold">{project.name}</h1>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              {project.sourceType === "github_url" ? <><Github className="h-4 w-4" /> {project.sourceUrl}</> : 
+              {project.sourceType === "github_url" ? <><FolderGit2 className="h-4 w-4" /> {project.sourceUrl}</> : 
                project.sourceType === "upload" ? <><Upload className="h-4 w-4" /> Uploaded ZIP</> : <><FileText className="h-4 w-4" /> Text</>}
             </div>
           </div>
