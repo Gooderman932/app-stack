@@ -52,7 +52,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 litellm==1.80.0
 markdown-it-py==4.0.0
-MarkupSafe==3.0.3
+MarkupSafe==3.0.4
 mccabe==0.7.0
 mdurl==0.1.2
 motor==3.3.1
