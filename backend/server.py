@@ -23,6 +23,7 @@ import zipfile
 import io
 import json
 import secrets
+import hashlib
 import jwt as pyjwt
 import aiofiles
 import tempfile
@@ -115,8 +116,22 @@ PLAY_PRODUCT_TIERS = {
 # current way to wire startup/shutdown hooks.
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # startup: nothing to do today
+    # One Google Play purchase token pays for one account. The verify route
+    # checks that; this unique index makes it hold even when two accounts
+    # race to claim the same token. Built in the background so a slow or
+    # unreachable database does not block startup.
+    async def _ensure_indexes():
+        try:
+            await db.payment_transactions.create_index(
+                "sessionId", unique=True,
+                partialFilterExpression={"sessionId": {"$type": "string"}},
+            )
+        except Exception as e:  # noqa: BLE001 - logged, never fatal
+            logging.getLogger(__name__).error(
+                "Could not ensure unique payment_transactions.sessionId: %s", e)
+    index_task = asyncio.create_task(_ensure_indexes())
     yield
+    index_task.cancel()
     # shutdown: close the Mongo client
     client.close()
 
@@ -382,7 +397,7 @@ async def get_user_tier_limits(user_id: str) -> dict:
     if not user:
         return SUBSCRIPTION_TIERS["free"]
     
-    tier = user.get("subscription", "free")
+    tier = await effective_tier(user)
     return SUBSCRIPTION_TIERS.get(tier, SUBSCRIPTION_TIERS["free"])
 
 async def check_project_limit(user_id: str) -> bool:
@@ -663,7 +678,7 @@ async def get_current_user_profile(current_user: dict = Depends(get_current_user
     user = dict(current_user)
     project_count = await db.projects.count_documents({"userId": user["id"]})
     user["projectCount"] = project_count
-    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
+    await _apply_effective_tier(user)
     return user
 
 
@@ -675,7 +690,7 @@ async def get_user(user_id: str, current_user: dict = Depends(get_current_user))
     user = dict(current_user)
     project_count = await db.projects.count_documents({"userId": user_id})
     user["projectCount"] = project_count
-    user["tierLimits"] = SUBSCRIPTION_TIERS.get(user.get("subscription", "free"))
+    await _apply_effective_tier(user)
     return user
 
 # --- Google OAuth Route ---
@@ -712,7 +727,7 @@ async def auth_with_google(request: Request):
     if existing:
         project_count = await db.projects.count_documents({"userId": existing["id"]})
         existing["projectCount"] = project_count
-        existing["tierLimits"] = SUBSCRIPTION_TIERS.get(existing.get("subscription", "free"))
+        await _apply_effective_tier(existing)
         existing["sessionToken"] = create_session_token(existing)
         return existing
 
@@ -761,67 +776,226 @@ async def _play_publisher():
     return _play_publisher_instance
 
 
+# Subscription states in which Google Play grants access. CANCELED means
+# auto-renew is off but the paid period has not ended yet.
+PLAY_ACCESS_STATES = {"SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD"}
+# While Google cannot be reached to confirm a renewal, a lapsed subscription
+# keeps its tier this long (outage tolerance, not free time).
+PLAY_RENEWAL_CHECK_GRACE = timedelta(hours=72)
+# User-document fields the effective-tier check needs.
+TIER_FIELDS = {"id": 1, "subscription": 1, "subscriptionExpiresAt": 1, "playPurchaseToken": 1}
+
+_PLAY_TIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _parse_play_time(value) -> Optional[datetime]:
+    """Parse an RFC 3339 timestamp from the Play Developer API (up to 9 fractional digits)."""
+    if not isinstance(value, str):
+        return None
+    m = _PLAY_TIME_RE.match(value)
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    frac = ((frac or "") + "000000")[:6]
+    return datetime.fromisoformat(f"{base}.{frac}{'+00:00' if tz == 'Z' else tz}")
+
+
+def _parse_stored_time(value) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def play_account_id(user_id: str) -> str:
+    """The obfuscatedAccountId the Android app attaches to this user's purchases.
+
+    Mirrors cordova-plugin-purchase's 'uuid' obfuscator (App.js sets
+    store.obfuscator = 'uuid' and applicationUsername = the user id): the MD5
+    of the user id, formatted as a UUID with version nibble 3 and variant 8.
+    """
+    h = hashlib.md5(user_id.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"{h[0:8]}-{h[8:12]}-3{h[13:16]}-8{h[17:20]}-{h[20:32]}"
+
+
+async def _fetch_play_subscription(purchase_token: str) -> dict:
+    service = await _play_publisher()
+    return await asyncio.to_thread(
+        lambda: service.purchases().subscriptionsv2().get(
+            packageName=PLAY_PACKAGE_NAME,
+            token=purchase_token,
+        ).execute()
+    )
+
+
+def _play_line_item(result: dict, product_id: Optional[str] = None) -> Optional[dict]:
+    """The line item for one of our subscription products (optionally a given one)."""
+    for item in result.get("lineItems") or []:
+        pid = item.get("productId")
+        if pid in PLAY_PRODUCT_TIERS and (product_id is None or pid == product_id):
+            return item
+    return None
+
+
+def _play_access_until(result: dict, item: dict, now: datetime) -> Optional[datetime]:
+    """When this Play subscription's access ends, or None if it grants none now."""
+    state = result.get("subscriptionState")
+    expiry = _parse_play_time(item.get("expiryTime"))
+    if state in PLAY_ACCESS_STATES:
+        # In a grace period Google keeps access past expiryTime: check again tomorrow.
+        return expiry if expiry and expiry > now else now + timedelta(days=1)
+    if state == "SUBSCRIPTION_STATE_CANCELED" and expiry and expiry > now:
+        return expiry
+    return None
+
+
+async def effective_tier(user: Optional[dict]) -> str:
+    """The tier this user is entitled to right now.
+
+    Google Play subscriptions carry an expiry. Once it passes, ask Google
+    whether the subscription renewed (renewals keep the same purchase token,
+    and the app does not re-send purchases it already acknowledged): extend it
+    if so, drop the account to free if not. Grants without an expiry (made
+    before expiry tracking, or set by hand) are left as they are.
+    """
+    if not user:
+        return "free"
+    tier = user.get("subscription") or "free"
+    if tier == "free" or tier not in SUBSCRIPTION_TIERS:
+        return "free"
+    expires_at = _parse_stored_time(user.get("subscriptionExpiresAt"))
+    now = datetime.now(timezone.utc)
+    if expires_at is None or now < expires_at:
+        return tier
+
+    token = user.get("playPurchaseToken")
+    if token and PLAY_SERVICE_ACCOUNT_FILE:
+        try:
+            result = await _fetch_play_subscription(token)
+        except Exception as e:  # noqa: BLE001 - outage handling below
+            logger.warning("Play renewal check failed for user %s: %s", user.get("id"), e)
+            return tier if now - expires_at < PLAY_RENEWAL_CHECK_GRACE else "free"
+        item = _play_line_item(result)
+        access_until = _play_access_until(result, item, now) if item else None
+        if access_until:
+            renewed_tier = PLAY_PRODUCT_TIERS[item["productId"]]
+            await db.users.update_one({"id": user["id"]}, {"$set": {
+                "subscription": renewed_tier,
+                "subscriptionStatus": "active",
+                "subscriptionExpiresAt": access_until.isoformat(),
+                "updatedAt": now.isoformat(),
+            }})
+            return renewed_tier
+
+    await db.users.update_one({"id": user["id"]}, {"$set": {
+        "subscription": "free",
+        "subscriptionStatus": "expired",
+        "updatedAt": now.isoformat(),
+    }})
+    return "free"
+
+
+async def _apply_effective_tier(user: dict) -> None:
+    """Rewrite a user document for an API response: current tier, no purchase token."""
+    tier = await effective_tier(user)
+    user["subscription"] = tier
+    user["tierLimits"] = SUBSCRIPTION_TIERS.get(tier, SUBSCRIPTION_TIERS["free"])
+    user.pop("playPurchaseToken", None)
+
+
 @api_router.post("/billing/verify")
 async def verify_play_purchase(request: PlayVerifyRequest, current_user: dict = Depends(get_current_user)):
-    """Verify a Google Play subscription purchase token and grant the matching tier."""
+    """Verify a Google Play subscription purchase token and grant the matching tier.
+
+    Only what Google reports is trusted: the tier comes from the product the
+    token actually bought, the token must belong to this account, and the
+    grant lasts until the subscription's expiry (see effective_tier).
+    """
     if request.userId != current_user["id"]:
         raise HTTPException(status_code=403, detail="You can only verify purchases for your own account")
     if not PLAY_SERVICE_ACCOUNT_FILE:
         raise HTTPException(status_code=500, detail="Play billing not configured on this server")
-
-    tier = PLAY_PRODUCT_TIERS.get(request.productId)
-    if not tier:
+    if request.productId not in PLAY_PRODUCT_TIERS:
         raise HTTPException(status_code=400, detail="Unknown product")
 
-    user = await db.users.find_one({"id": request.userId}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    # One purchase token pays for one account.
+    claimed = await db.payment_transactions.find_one(
+        {"sessionId": request.purchaseToken}, {"_id": 0, "userId": 1})
+    if claimed and claimed.get("userId") != current_user["id"]:
+        raise HTTPException(status_code=409, detail="This purchase is linked to another account")
 
-    # Validate the purchase token against the Play Developer API (subscriptions v2)
     try:
-        service = await _play_publisher()
-        result = await asyncio.to_thread(
-            lambda: service.purchases().subscriptionsv2().get(
-                packageName=PLAY_PACKAGE_NAME,
-                token=request.purchaseToken,
-            ).execute()
-        )
+        result = await _fetch_play_subscription(request.purchaseToken)
     except Exception as e:
         logger.error(f"Play verification error: {e}")
         raise HTTPException(status_code=400, detail="Could not verify purchase")
 
-    state = result.get("subscriptionState")
-    active = state in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD")
-    if not active:
-        raise HTTPException(status_code=400, detail=f"Subscription not active ({state})")
+    # The tier comes from what Google says was bought, never from the request.
+    item = _play_line_item(result, request.productId)
+    if not item:
+        raise HTTPException(status_code=400, detail="Purchase does not match the requested product")
+    tier = PLAY_PRODUCT_TIERS[item["productId"]]
+
+    # Purchases made by the app carry the buyer's obfuscated account id.
+    owner = (result.get("externalAccountIdentifiers") or {}).get("obfuscatedExternalAccountId")
+    if owner and owner != play_account_id(current_user["id"]):
+        raise HTTPException(status_code=403, detail="This purchase belongs to another account")
+
+    now = datetime.now(timezone.utc)
+    access_until = _play_access_until(result, item, now)
+    if not access_until:
+        raise HTTPException(
+            status_code=400, detail=f"Subscription not active ({result.get('subscriptionState')})")
 
     # Record the transaction and upgrade the user's tier
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = now.isoformat()
     transaction = PaymentTransaction(
-        userId=request.userId,
+        userId=current_user["id"],
         sessionId=request.purchaseToken,
         tier=tier,
         amount=SUBSCRIPTION_TIERS.get(tier, {}).get("price", 0.0),
         currency="usd",
         status="paid",
         paymentStatus="paid",
-        metadata={"productId": request.productId, "source": "google_play"},
+        metadata={
+            "productId": item["productId"],
+            "source": "google_play",
+            "expiresAt": access_until.isoformat(),
+            "testPurchase": "testPurchase" in result,
+            "linkedPurchaseToken": result.get("linkedPurchaseToken"),
+        },
     )
     tx_doc = transaction.model_dump()
     tx_doc["createdAt"] = tx_doc["createdAt"].isoformat()
     tx_doc["updatedAt"] = tx_doc["updatedAt"].isoformat()
-    await db.payment_transactions.update_one(
-        {"sessionId": request.purchaseToken},
-        {"$set": tx_doc},
-        upsert=True,
-    )
+    # Re-verifying the same purchase refreshes the record but keeps its identity.
+    on_insert = {"id": tx_doc.pop("id"), "createdAt": tx_doc.pop("createdAt")}
+    try:
+        await db.payment_transactions.update_one(
+            {"sessionId": request.purchaseToken, "userId": current_user["id"]},
+            {"$set": tx_doc, "$setOnInsert": on_insert},
+            upsert=True,
+        )
+    except Exception as e:  # unique index: another account claimed it first
+        if type(e).__name__ == "DuplicateKeyError":
+            raise HTTPException(status_code=409, detail="This purchase is linked to another account")
+        raise
 
     await db.users.update_one(
-        {"id": request.userId},
-        {"$set": {"subscription": tier, "subscriptionStatus": "active", "updatedAt": now_iso}},
+        {"id": current_user["id"]},
+        {"$set": {
+            "subscription": tier,
+            "subscriptionStatus": "active",
+            "subscriptionExpiresAt": access_until.isoformat(),
+            "playPurchaseToken": request.purchaseToken,
+            "updatedAt": now_iso,
+        }},
     )
 
-    return {"status": "active", "tier": tier}
+    return {"status": "active", "tier": tier, "expiresAt": access_until.isoformat()}
 
 
 @api_router.get("/checkout/status/{session_id}")
@@ -960,8 +1134,8 @@ async def analyze_project(request: Request, project_id: str, reanalyze: bool = F
 
     # Per-user daily Gemini quota (tier-aware).
     if user_id:
-        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
-        tier = (user or {}).get("subscription", "free")
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, **TIER_FIELDS})
+        tier = await effective_tier(user)
         allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
         if not allowed:
             raise HTTPException(
@@ -1011,8 +1185,8 @@ async def generate_content(http_request: Request, project_id: str, request: Gene
     # Per-user daily Gemini quota (tier-aware) — same accounting as /analyze.
     user_id = project.get("userId")
     if user_id:
-        user = await db.users.find_one({"id": user_id}, {"_id": 0, "subscription": 1})
-        tier = (user or {}).get("subscription", "free")
+        user = await db.users.find_one({"id": user_id}, {"_id": 0, **TIER_FIELDS})
+        tier = await effective_tier(user)
         allowed, used, quota = await check_and_consume_gemini_quota(db, user_id, tier)
         if not allowed:
             raise HTTPException(
