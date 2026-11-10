@@ -95,3 +95,8 @@ android-sdk/
 *.db
 *.sqlite
 *.sqlite3
+
+# Android signing keys (Play upload key); never commit them
+*.jks
+*.keystore
+*.p12

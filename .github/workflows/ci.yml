@@ -81,6 +81,10 @@ jobs:
             echo "::error::Tracked .env file detected"
             exit 1
           fi
+          if git ls-files | grep -E '\.(jks|keystore|p12)$'; then
+            echo "::error::Tracked Android signing key detected; keep it in the KEYSTORE_BASE64 secret only"
+            exit 1
+          fi
           if git grep -nE '(sk_live_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----)' -- . ':!*.example' ':!*.md' ':!.github/workflows/**'; then
             echo "::error::Looks like a real secret was committed"
             exit 1
