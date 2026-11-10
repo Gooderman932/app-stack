@@ -365,6 +365,13 @@ const PricingPage = () => {
     if (!IS_NATIVE || !window.CdvPurchase) return;
     const { store, ProductType, Platform } = window.CdvPurchase;
 
+    // Tie each purchase to the signed-in account: Google stores this as the
+    // purchase's obfuscatedAccountId, and the backend refuses a purchase made
+    // for another account (play_account_id in server.py uses the same 'uuid'
+    // obfuscation of the user id).
+    store.obfuscator = "uuid";
+    store.applicationUsername = () => userIdRef.current || undefined;
+
     store.register([
       { id: "pro", type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY },
       { id: "team", type: ProductType.PAID_SUBSCRIPTION, platform: Platform.GOOGLE_PLAY },
@@ -374,19 +381,26 @@ const PricingPage = () => {
       const productId = transaction.products?.[0]?.id;
       const purchaseToken = transaction.nativePurchase?.purchaseToken;
       const uid = userIdRef.current;
-      if (uid && productId && purchaseToken) {
-        try {
-          const res = await axios.post(`${API}/billing/verify`, { userId: uid, productId, purchaseToken });
-          if (res.data?.status === "active") {
-            await refreshUser();
-            toast.success("Subscription active!");
-          }
-        } catch (e) {
-          toast.error("Could not verify purchase");
+      // Acknowledge (finish) a purchase only once the server has granted the
+      // plan. An unacknowledged purchase comes back on the next launch for
+      // another try, and Google refunds it after 3 days if it is never
+      // granted, so nobody pays for a plan they did not get.
+      try {
+        if (!uid || !productId || !purchaseToken) return;
+        const res = await axios.post(`${API}/billing/verify`, { userId: uid, productId, purchaseToken });
+        if (res.data?.status === "active") {
+          await transaction.finish();
+          await refreshUser();
+          toast.success("Subscription active!");
         }
+      } catch (e) {
+        const status = e?.response?.status;
+        toast.error(status === 403 || status === 409
+          ? "This purchase belongs to a different account."
+          : "Could not confirm your purchase yet. It will be retried the next time you open the app.");
+      } finally {
+        setLoadingTier(null);
       }
-      transaction.finish();
-      setLoadingTier(null);
     });
 
     store.initialize([Platform.GOOGLE_PLAY]);
