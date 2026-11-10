@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 
 from rate_limit import limiter, check_and_consume_gemini_quota
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 import os
 import logging
 import re
@@ -979,10 +980,8 @@ async def verify_play_purchase(request: PlayVerifyRequest, current_user: dict = 
             {"$set": tx_doc, "$setOnInsert": on_insert},
             upsert=True,
         )
-    except Exception as e:  # unique index: another account claimed it first
-        if type(e).__name__ == "DuplicateKeyError":
-            raise HTTPException(status_code=409, detail="This purchase is linked to another account")
-        raise
+    except DuplicateKeyError:  # unique index: another account claimed it first
+        raise HTTPException(status_code=409, detail="This purchase is linked to another account")
 
     await db.users.update_one(
         {"id": current_user["id"]},
