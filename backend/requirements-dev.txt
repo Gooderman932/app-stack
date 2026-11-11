@@ -25,6 +25,7 @@ anyio==4.16.0 \
     #   -c requirements.txt
     #   google-genai
     #   httpx
+    #   httpx2
     #   starlette
 ast-serialize==0.13.1 \
     --hash=sha256:02686b281ec9b8e9614f6f0db27e12e4cac515f336c5d05b678bc9eb73ff2af5 \
@@ -512,7 +513,7 @@ google-api-python-client==2.201.0 \
     # via
     #   -c requirements.txt
     #   -r requirements.in
-google-auth==2.62.1 \
+google-auth[requests]==2.62.1 \
     --hash=sha256:015399a5abde39033c69404cc1c079e6d4c2de2993e164c9f4eac6e5376ad72b \
     --hash=sha256:3c8e1ce2553784ae17fd220e6f88df3281d86ab98019278f436d06dffab17a9e
     # via
@@ -528,9 +529,9 @@ google-auth-httplib2==0.4.4 \
     # via
     #   -c requirements.txt
     #   google-api-python-client
-google-genai==2.34.0 \
-    --hash=sha256:8e182cf3f73384167b96861cf0aef5102b5070f2db1ea11002879e913806ef37 \
-    --hash=sha256:a4cb02aebc4c357f863d2938132f0e3f7967fc5e00b8a4078673f68aad340665
+google-genai==3.0.0 \
+    --hash=sha256:af56a7754312c3a4a562e100160d05b701d03d5f49101e6c85796694a789ae07 \
+    --hash=sha256:f3e1a05a464a39cb6caf59a69824d3c54ef20dc5e403ff8fab1f4662cb18edf9
     # via
     #   -c requirements.txt
     #   -r requirements.in
@@ -546,6 +547,7 @@ h11==0.16.0 \
     # via
     #   -c requirements.txt
     #   httpcore
+    #   httpcore2
     #   uvicorn
 httpcore==1.0.9 \
     --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55 \
@@ -553,6 +555,12 @@ httpcore==1.0.9 \
     # via
     #   -c requirements.txt
     #   httpx
+httpcore2==2.16.0 \
+    --hash=sha256:5c4358319f2602d984ad93182c9fee5160f22e9da7babdda870a5e7c4e2dc34f \
+    --hash=sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643
+    # via
+    #   -c requirements.txt
+    #   httpx2
 httplib2==0.32.1 \
     --hash=sha256:37900eb8a74576bd99fc39ae1dc8409f95f965d45b56cbcb2194bb55f58a90e1 \
     --hash=sha256:82e7a6ab08fcb27879864ddf63dbb529fb032ca336c331cb1597d6dd8b47c92e
@@ -566,6 +574,11 @@ httpx==0.28.1 \
     # via
     #   -c requirements.txt
     #   -r requirements.in
+httpx2==2.16.0 \
+    --hash=sha256:0d54c98128e8f2ff7fbbde0fca8c359e5f032edeaaaac443cdb7f31f685bcd7f \
+    --hash=sha256:fd2c5d7909e8d86fe92d53020c310ca0e4e431b838c207c5754b9bbf0308d49a
+    # via
+    #   -c requirements.txt
     #   google-genai
 idna==3.20 \
     --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
@@ -574,6 +587,7 @@ idna==3.20 \
     #   -c requirements.txt
     #   anyio
     #   httpx
+    #   httpx2
     #   requests
 iniconfig==2.3.1 \
     --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960 \
@@ -1263,12 +1277,18 @@ tenacity==9.1.4 \
     # via
     #   -c requirements.txt
     #   google-genai
+truststore==0.10.5 \
+    --hash=sha256:30d36967ccaded5cbb38d602c433f53600036c79d502f4533a49b60a03bbefcd \
+    --hash=sha256:9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c
+    # via
+    #   -c requirements.txt
+    #   httpcore2
+    #   httpx2
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
     # via
     #   -c requirements.txt
-    #   anyio
     #   fastapi
     #   google-genai
     #   limits
